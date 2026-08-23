@@ -12,10 +12,26 @@ export type OwnerCandidate = {
 
 type SearchResult = { title: string; url: string; snippet: string; engine: "duckduckgo" | "bing" };
 
+type SourcePage = { text: string; ok: boolean };
+
 const rolePattern = /(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)/i;
 const personName = `[A-Z][a-zA-Z'.-]+(?:\\s+[A-Z][a-zA-Z'.-]+){1,2}`;
 const blockedWords = new Set(["because", "for", "and", "the", "with", "from", "at", "of", "in", "to", "by", "is", "as", "a", "an", "no-brainer"]);
 const blockedPhrases = ["google maps", "better business", "linkedin", "facebook", "yellow pages", "registered agent", "discover company principals", "customer service", "company profile", "business profile", "contact information"];
+
+const externalSourceDomains = [
+  "bbb.org",
+  "bizapedia.com",
+  "opencorporates.com",
+  "linkedin.com",
+  "manta.com",
+  "einpresswire.com",
+  "prweb.com",
+  "prnewswire.com",
+  "chamberofcommerce.com",
+  "yelp.com",
+  "facebook.com",
+];
 
 function normalize(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
@@ -38,8 +54,9 @@ function extractPeopleNearRoles(text: string, businessName: string) {
   const matches: Array<{ name: string; title: string }> = [];
   const patterns = [
     new RegExp(`(${personName})\\s*[-–—,:|]\\s*(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)`, "g"),
-    new RegExp(`(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)\\s*[-–—,:|]?\\s*(${personName})`, "gi"),
-    new RegExp(`(${personName})\\s+(?:is|as|serves as|works as)?\\s*(?:the\\s+)?(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)`, "g"),
+    new RegExp(`(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)\\s*[-–—,:|]?\\s*(?:mr\\.?|ms\\.?|mrs\\.?)?\\s*(${personName})`, "gi"),
+    new RegExp(`(?:mr\\.?|ms\\.?|mrs\\.?)?\\s*(${personName})\\s+(?:is|as|serves as|works as|,)?\\s*(?:the\\s+)?(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)`, "g"),
+    new RegExp(`(?:business management|principal contacts?|customer contacts?)\\s*[:\\-]?\\s*(?:mr\\.?|ms\\.?|mrs\\.?)?\\s*(${personName})\\s*,?\\s*(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)`, "gi"),
   ];
 
   for (const pattern of patterns) {
@@ -53,7 +70,14 @@ function extractPeopleNearRoles(text: string, businessName: string) {
       if (looksLikePerson(name, businessName)) matches.push({ name: name.trim(), title: title.trim() });
     }
   }
-  return matches;
+
+  const seen = new Set<string>();
+  return matches.filter((item) => {
+    const key = `${normalize(item.name)}|${normalize(item.title)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function uniq(values: string[]) {
@@ -70,7 +94,7 @@ function extractEmails(text: string) {
   return uniq(matches).filter((email) => !/example\.(com|org|net)$/i.test(email)).slice(0, 6);
 }
 
-function extractNearby(text: string, needle: string, radius = 220) {
+function extractNearby(text: string, needle: string, radius = 150) {
   const haystack = text.toLowerCase();
   const target = needle.toLowerCase();
   const chunks: string[] = [];
@@ -88,7 +112,7 @@ function extractNearby(text: string, needle: string, radius = 220) {
 }
 
 function extractVerifiedContacts(text: string, ownerName: string) {
-  const nearby = extractNearby(text, ownerName, 220);
+  const nearby = extractNearby(text, ownerName, 150);
   if (!nearby) return { phones: [] as string[], emails: [] as string[] };
   return { phones: extractPhones(nearby), emails: extractEmails(nearby) };
 }
@@ -103,10 +127,29 @@ function decodeDuckDuckGoUrl(href: string) {
   }
 }
 
+function isExternalSource(url: string) {
+  try {
+    const host = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+    return externalSourceDomains.some((domain) => host === domain || host.endsWith(`.${domain}`));
+  } catch {
+    return false;
+  }
+}
+
+function sourceWeight(url: string) {
+  const value = url.toLowerCase();
+  if (value.includes("bbb.org")) return 12;
+  if (value.includes("opencorporates.com") || value.includes("bizapedia.com")) return 10;
+  if (value.includes("manta.com") || value.includes("chamberofcommerce.com")) return 8;
+  if (value.includes("linkedin.com")) return 7;
+  if (value.includes("einpresswire.com") || value.includes("prweb.com") || value.includes("prnewswire.com")) return 7;
+  return 4;
+}
+
 function parseDdgHtml(html: string): SearchResult[] {
   const $ = cheerio.load(html);
   const results: SearchResult[] = [];
-  $(".result").slice(0, 10).each((_, element) => {
+  $(".result").slice(0, 12).each((_, element) => {
     const title = $(element).find(".result__a").text().trim();
     const href = $(element).find(".result__a").attr("href") || "";
     const snippet = $(element).find(".result__snippet").text().replace(/\s+/g, " ").trim();
@@ -118,7 +161,7 @@ function parseDdgHtml(html: string): SearchResult[] {
 function parseDdgLite(html: string): SearchResult[] {
   const $ = cheerio.load(html);
   const results: SearchResult[] = [];
-  $("a.result-link").slice(0, 10).each((_, element) => {
+  $("a.result-link").slice(0, 12).each((_, element) => {
     const title = $(element).text().trim();
     const href = $(element).attr("href") || "";
     const row = $(element).closest("tr");
@@ -131,7 +174,7 @@ function parseDdgLite(html: string): SearchResult[] {
 function parseBingHtml(html: string): SearchResult[] {
   const $ = cheerio.load(html);
   const results: SearchResult[] = [];
-  $("li.b_algo").slice(0, 10).each((_, element) => {
+  $("li.b_algo").slice(0, 12).each((_, element) => {
     const link = $(element).find("h2 a").first();
     const title = link.text().trim();
     const href = link.attr("href") || "";
@@ -184,9 +227,7 @@ async function bingSearch(query: string) {
 }
 
 async function searchOwnerWeb(query: string) {
-  const ddg = await duckDuckGoSearch(query);
-  if (ddg.length >= 3) return ddg;
-  const bing = await bingSearch(query);
+  const [ddg, bing] = await Promise.all([duckDuckGoSearch(query), bingSearch(query)]);
   const seen = new Set<string>();
   return [...ddg, ...bing].filter((item) => {
     const key = item.url || `${item.title}|${item.snippet}`;
@@ -196,7 +237,7 @@ async function searchOwnerWeb(query: string) {
   });
 }
 
-async function fetchPublicSource(url: string, ownerName: string) {
+async function fetchSourcePage(url: string): Promise<SourcePage> {
   try {
     const response = await fetch(url, {
       redirect: "follow",
@@ -204,63 +245,85 @@ async function fetchPublicSource(url: string, ownerName: string) {
       signal: AbortSignal.timeout(7000),
       headers: searchHeaders,
     });
-    if (!response.ok) return { phones: [] as string[], emails: [] as string[] };
+    if (!response.ok) return { text: "", ok: false };
     const html = await response.text();
     const $ = cheerio.load(html);
     $("script,style,noscript,svg").remove();
-    const visible = $("body").text().replace(/\s+/g, " ");
-    return extractVerifiedContacts(visible, ownerName);
+    const text = $("body").text().replace(/\s+/g, " ").trim();
+    return { text, ok: Boolean(text) };
   } catch {
-    return { phones: [] as string[], emails: [] as string[] };
+    return { text: "", ok: false };
   }
 }
 
 export async function findOwnerCandidates(business: Business): Promise<OwnerCandidate[]> {
   if (!business.name) return [];
+
   const location = business.address ? ` ${business.address}` : "";
   const queries = [
     `"${business.name}" owner${location}`,
     `"${business.name}" president${location}`,
     `"${business.name}" founder${location}`,
-    `"${business.name}" "managing member"${location}`,
+    `site:bbb.org "${business.name}"`,
+    `site:bizapedia.com "${business.name}"`,
+    `site:manta.com "${business.name}"`,
+    `site:einpresswire.com "${business.name}"`,
+    `site:prweb.com "${business.name}"`,
+    `site:prnewswire.com "${business.name}"`,
   ];
 
   const pages: SearchResult[] = [];
   for (const query of queries) {
     const results = await searchOwnerWeb(query);
     pages.push(...results);
-    await new Promise((resolve) => setTimeout(resolve, 180));
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+
+  const uniquePages = new Map<string, SearchResult>();
+  for (const page of pages) {
+    if (!page.url) continue;
+    const key = page.url.replace(/#.*$/, "");
+    if (!uniquePages.has(key)) uniquePages.set(key, page);
   }
 
   const candidates = new Map<string, OwnerCandidate>();
 
-  // Owner discovery is intentionally independent from phone/email enrichment.
-  for (const result of pages) {
-    const combined = `${result.title}. ${result.snippet}`;
-    const people = extractPeopleNearRoles(combined, business.name);
-    for (const person of people) {
-      const key = normalize(person.name);
-      const source = { label: result.title, url: result.url, snippet: result.snippet, phones: [] as string[], emails: [] as string[] };
-      const existing = candidates.get(key);
-
-      if (existing) {
-        if (!existing.sources.some((item) => item.url === source.url)) existing.sources.push(source);
-        existing.confidence = Math.min(98, existing.confidence + 18);
-      } else {
-        let confidence = 64;
-        if (/bbb|bizapedia|opencorporates|crunchbase|linkedin/i.test(`${result.title} ${result.url}`)) confidence += 8;
-        if (normalize(combined).includes(normalize(business.name))) confidence += 8;
-        if (result.engine === "bing") confidence += 2;
-        candidates.set(key, {
-          name: person.name,
-          title: person.title,
-          confidence: Math.min(confidence, 90),
-          phones: [],
-          emails: [],
-          sources: [source],
-        });
-      }
+  function addCandidate(person: { name: string; title: string }, result: SearchResult, bonus = 0) {
+    const key = normalize(person.name);
+    const source = { label: result.title, url: result.url, snippet: result.snippet, phones: [] as string[], emails: [] as string[] };
+    const existing = candidates.get(key);
+    if (existing) {
+      if (!existing.sources.some((item) => item.url === source.url)) existing.sources.push(source);
+      existing.confidence = Math.min(98, existing.confidence + 14 + bonus);
+      return;
     }
+
+    let confidence = 62 + sourceWeight(result.url) + bonus;
+    const combined = `${result.title}. ${result.snippet}`;
+    if (normalize(combined).includes(normalize(business.name))) confidence += 6;
+    candidates.set(key, {
+      name: person.name,
+      title: person.title,
+      confidence: Math.min(confidence, 92),
+      phones: [],
+      emails: [],
+      sources: [source],
+    });
+  }
+
+  // Pass 1: fast extraction from search result titles/snippets.
+  for (const result of uniquePages.values()) {
+    const combined = `${result.title}. ${result.snippet}`;
+    for (const person of extractPeopleNearRoles(combined, business.name)) addCandidate(person, result);
+  }
+
+  // Pass 2: deep parse trusted external sources. This does not use company websites.
+  const externalPages = [...uniquePages.values()].filter((result) => isExternalSource(result.url)).slice(0, 16);
+  for (const result of externalPages) {
+    const page = await fetchSourcePage(result.url);
+    if (!page.ok) continue;
+    const textForDiscovery = `${result.title}. ${result.snippet}. ${page.text}`;
+    for (const person of extractPeopleNearRoles(textForDiscovery, business.name)) addCandidate(person, result, 8);
   }
 
   const ranked = [...candidates.values()]
@@ -268,17 +331,22 @@ export async function findOwnerCandidates(business: Business): Promise<OwnerCand
     .sort((a, b) => b.confidence - a.confidence || b.sources.length - a.sources.length)
     .slice(0, 5);
 
-  // Only after the owner is known do we attempt verified contact enrichment.
+  // Contact enrichment stays separate and can never remove an owner candidate.
   for (const candidate of ranked) {
-    for (const source of candidate.sources.slice(0, 3)) {
-      const snippetContact = extractVerifiedContacts(`${source.label}. ${source.snippet || ""}`, candidate.name);
-      const pageContact = await fetchPublicSource(source.url, candidate.name);
+    for (const source of candidate.sources.slice(0, 4)) {
+      const snippetText = `${source.label}. ${source.snippet || ""}`;
+      const snippetContact = extractVerifiedContacts(snippetText, candidate.name);
+      let pageContact = { phones: [] as string[], emails: [] as string[] };
+      if (isExternalSource(source.url)) {
+        const page = await fetchSourcePage(source.url);
+        if (page.ok) pageContact = extractVerifiedContacts(page.text, candidate.name);
+      }
       source.phones = uniq([...snippetContact.phones, ...pageContact.phones]);
       source.emails = uniq([...snippetContact.emails, ...pageContact.emails]);
       candidate.phones = uniq([...candidate.phones, ...source.phones]);
       candidate.emails = uniq([...candidate.emails, ...source.emails]);
     }
-    if (candidate.phones.length || candidate.emails.length) candidate.confidence = Math.min(98, candidate.confidence + 3);
+    if (candidate.phones.length || candidate.emails.length) candidate.confidence = Math.min(98, candidate.confidence + 2);
   }
 
   return ranked;
