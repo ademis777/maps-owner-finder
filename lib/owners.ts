@@ -100,12 +100,11 @@ async function fetchPublicSource(url: string) {
   }
 }
 
-async function duckDuckGoSearch(query: string) {
-  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  const response = await fetch(url, { cache: "no-store", headers: { "user-agent": "Mozilla/5.0", "accept-language": "en-US,en;q=0.9" } });
-  if (!response.ok) return [];
-  const $ = cheerio.load(await response.text());
-  const results: Array<{ title: string; url: string; snippet: string }> = [];
+type SearchResult = { title: string; url: string; snippet: string };
+
+function parseDdgHtml(html: string): SearchResult[] {
+  const $ = cheerio.load(html);
+  const results: SearchResult[] = [];
   $(".result").slice(0, 10).each((_, element) => {
     const title = $(element).find(".result__a").text().trim();
     const href = $(element).find(".result__a").attr("href") || "";
@@ -113,6 +112,49 @@ async function duckDuckGoSearch(query: string) {
     if (title && href) results.push({ title, url: decodeDuckDuckGoUrl(href), snippet });
   });
   return results;
+}
+
+function parseDdgLite(html: string): SearchResult[] {
+  const $ = cheerio.load(html);
+  const results: SearchResult[] = [];
+  $("a.result-link").slice(0, 10).each((_, element) => {
+    const title = $(element).text().trim();
+    const href = $(element).attr("href") || "";
+    const row = $(element).closest("tr");
+    const snippet = row.next().text().replace(/\s+/g, " ").trim();
+    if (title && href) results.push({ title, url: decodeDuckDuckGoUrl(href), snippet });
+  });
+  return results;
+}
+
+async function duckDuckGoSearch(query: string) {
+  const headers = {
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+    "accept-language": "en-US,en;q=0.9",
+  };
+
+  try {
+    const response = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(8000),
+      headers,
+    });
+    if (response.ok) {
+      const results = parseDdgHtml(await response.text());
+      if (results.length) return results;
+    }
+  } catch {}
+
+  try {
+    const response = await fetch(`https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(8000),
+      headers,
+    });
+    if (response.ok) return parseDdgLite(await response.text());
+  } catch {}
+
+  return [];
 }
 
 export async function findOwnerCandidates(business: Business): Promise<OwnerCandidate[]> {
@@ -125,41 +167,62 @@ export async function findOwnerCandidates(business: Business): Promise<OwnerCand
     `"${business.name}" "managing member"${location}`,
   ];
 
-  const pages = (await Promise.all(queries.map(duckDuckGoSearch))).flat();
+  const pages: SearchResult[] = [];
+  for (const query of queries) {
+    const results = await duckDuckGoSearch(query);
+    pages.push(...results);
+    if (results.length) await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
   const candidates = new Map<string, OwnerCandidate>();
 
+  // Discovery first: candidates are saved from search results even if source pages later block us.
   for (const result of pages) {
     const combined = `${result.title}. ${result.snippet}`;
     const people = extractPeopleNearRoles(combined, business.name);
-    if (!people.length) continue;
-
-    const contact = await fetchPublicSource(result.url);
-    const snippetPhones = extractPhones(combined);
-    const snippetEmails = extractEmails(combined);
-    const sourcePhones = uniq([...snippetPhones, ...contact.phones]);
-    const sourceEmails = uniq([...snippetEmails, ...contact.emails]);
-
     for (const person of people) {
       const key = normalize(person.name);
-      const source = { label: result.title, url: result.url, snippet: result.snippet, phones: sourcePhones, emails: sourceEmails };
+      const snippetPhones = extractPhones(combined);
+      const snippetEmails = extractEmails(combined);
+      const source = { label: result.title, url: result.url, snippet: result.snippet, phones: snippetPhones, emails: snippetEmails };
       const existing = candidates.get(key);
       if (existing) {
         if (!existing.sources.some((item) => item.url === source.url)) existing.sources.push(source);
-        existing.phones = uniq([...existing.phones, ...sourcePhones]);
-        existing.emails = uniq([...existing.emails, ...sourceEmails]);
+        existing.phones = uniq([...existing.phones, ...snippetPhones]);
+        existing.emails = uniq([...existing.emails, ...snippetEmails]);
         existing.confidence = Math.min(98, existing.confidence + 18);
       } else {
         let confidence = 64;
         if (/bbb|bizapedia|opencorporates|crunchbase|linkedin/i.test(`${result.title} ${result.url}`)) confidence += 8;
         if (normalize(combined).includes(normalize(business.name))) confidence += 8;
-        if (sourcePhones.length || sourceEmails.length) confidence += 5;
-        candidates.set(key, { name: person.name, title: person.title, confidence: Math.min(confidence, 92), phones: sourcePhones, emails: sourceEmails, sources: [source] });
+        candidates.set(key, {
+          name: person.name,
+          title: person.title,
+          confidence: Math.min(confidence, 90),
+          phones: snippetPhones,
+          emails: snippetEmails,
+          sources: [source],
+        });
       }
     }
   }
 
-  return [...candidates.values()]
+  const ranked = [...candidates.values()]
     .filter((candidate) => candidate.confidence >= 60)
     .sort((a, b) => b.confidence - a.confidence || b.sources.length - a.sources.length)
     .slice(0, 5);
+
+  // Enrichment second: failure here never removes a discovered owner.
+  for (const candidate of ranked) {
+    for (const source of candidate.sources.slice(0, 3)) {
+      const contact = await fetchPublicSource(source.url);
+      source.phones = uniq([...(source.phones || []), ...contact.phones]);
+      source.emails = uniq([...(source.emails || []), ...contact.emails]);
+      candidate.phones = uniq([...candidate.phones, ...contact.phones]);
+      candidate.emails = uniq([...candidate.emails, ...contact.emails]);
+    }
+    if (candidate.phones.length || candidate.emails.length) candidate.confidence = Math.min(98, candidate.confidence + 3);
+  }
+
+  return ranked;
 }
