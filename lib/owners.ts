@@ -10,6 +10,8 @@ export type OwnerCandidate = {
   sources: Array<{ label: string; url: string; snippet?: string; phones?: string[]; emails?: string[] }>;
 };
 
+type SearchResult = { title: string; url: string; snippet: string; engine: "duckduckgo" | "bing" };
+
 const rolePattern = /(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)/i;
 const personName = `[A-Z][a-zA-Z'.-]+(?:\\s+[A-Z][a-zA-Z'.-]+){1,2}`;
 const blockedWords = new Set(["because", "for", "and", "the", "with", "from", "at", "of", "in", "to", "by", "is", "as", "a", "an", "no-brainer"]);
@@ -39,6 +41,7 @@ function extractPeopleNearRoles(text: string, businessName: string) {
     new RegExp(`(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)\\s*[-–—,:|]?\\s*(${personName})`, "gi"),
     new RegExp(`(${personName})\\s+(?:is|as|serves as|works as)?\\s*(?:the\\s+)?(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)`, "g"),
   ];
+
   for (const pattern of patterns) {
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(text))) {
@@ -87,10 +90,7 @@ function extractNearby(text: string, needle: string, radius = 220) {
 function extractVerifiedContacts(text: string, ownerName: string) {
   const nearby = extractNearby(text, ownerName, 220);
   if (!nearby) return { phones: [] as string[], emails: [] as string[] };
-  return {
-    phones: extractPhones(nearby),
-    emails: extractEmails(nearby),
-  };
+  return { phones: extractPhones(nearby), emails: extractEmails(nearby) };
 }
 
 function decodeDuckDuckGoUrl(href: string) {
@@ -103,30 +103,6 @@ function decodeDuckDuckGoUrl(href: string) {
   }
 }
 
-async function fetchPublicSource(url: string, ownerName: string) {
-  try {
-    const response = await fetch(url, {
-      redirect: "follow",
-      cache: "no-store",
-      signal: AbortSignal.timeout(7000),
-      headers: {
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
-        "accept-language": "en-US,en;q=0.9",
-      },
-    });
-    if (!response.ok) return { phones: [] as string[], emails: [] as string[] };
-    const html = await response.text();
-    const $ = cheerio.load(html);
-    $("script,style,noscript,svg").remove();
-    const visible = $("body").text().replace(/\s+/g, " ");
-    return extractVerifiedContacts(visible, ownerName);
-  } catch {
-    return { phones: [] as string[], emails: [] as string[] };
-  }
-}
-
-type SearchResult = { title: string; url: string; snippet: string };
-
 function parseDdgHtml(html: string): SearchResult[] {
   const $ = cheerio.load(html);
   const results: SearchResult[] = [];
@@ -134,7 +110,7 @@ function parseDdgHtml(html: string): SearchResult[] {
     const title = $(element).find(".result__a").text().trim();
     const href = $(element).find(".result__a").attr("href") || "";
     const snippet = $(element).find(".result__snippet").text().replace(/\s+/g, " ").trim();
-    if (title && href) results.push({ title, url: decodeDuckDuckGoUrl(href), snippet });
+    if (title && href) results.push({ title, url: decodeDuckDuckGoUrl(href), snippet, engine: "duckduckgo" });
   });
   return results;
 }
@@ -147,22 +123,35 @@ function parseDdgLite(html: string): SearchResult[] {
     const href = $(element).attr("href") || "";
     const row = $(element).closest("tr");
     const snippet = row.next().text().replace(/\s+/g, " ").trim();
-    if (title && href) results.push({ title, url: decodeDuckDuckGoUrl(href), snippet });
+    if (title && href) results.push({ title, url: decodeDuckDuckGoUrl(href), snippet, engine: "duckduckgo" });
   });
   return results;
 }
 
-async function duckDuckGoSearch(query: string) {
-  const headers = {
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
-    "accept-language": "en-US,en;q=0.9",
-  };
+function parseBingHtml(html: string): SearchResult[] {
+  const $ = cheerio.load(html);
+  const results: SearchResult[] = [];
+  $("li.b_algo").slice(0, 10).each((_, element) => {
+    const link = $(element).find("h2 a").first();
+    const title = link.text().trim();
+    const href = link.attr("href") || "";
+    const snippet = $(element).find(".b_caption p, p").first().text().replace(/\s+/g, " ").trim();
+    if (title && href) results.push({ title, url: href, snippet, engine: "bing" });
+  });
+  return results;
+}
 
+const searchHeaders = {
+  "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+  "accept-language": "en-US,en;q=0.9",
+};
+
+async function duckDuckGoSearch(query: string) {
   try {
     const response = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
       cache: "no-store",
       signal: AbortSignal.timeout(8000),
-      headers,
+      headers: searchHeaders,
     });
     if (response.ok) {
       const results = parseDdgHtml(await response.text());
@@ -174,7 +163,7 @@ async function duckDuckGoSearch(query: string) {
     const response = await fetch(`https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`, {
       cache: "no-store",
       signal: AbortSignal.timeout(8000),
-      headers,
+      headers: searchHeaders,
     });
     if (response.ok) return parseDdgLite(await response.text());
   } catch {}
@@ -182,54 +171,92 @@ async function duckDuckGoSearch(query: string) {
   return [];
 }
 
+async function bingSearch(query: string) {
+  try {
+    const response = await fetch(`https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=en-US`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(8000),
+      headers: searchHeaders,
+    });
+    if (response.ok) return parseBingHtml(await response.text());
+  } catch {}
+  return [];
+}
+
+async function searchOwnerWeb(query: string) {
+  const ddg = await duckDuckGoSearch(query);
+  if (ddg.length >= 3) return ddg;
+  const bing = await bingSearch(query);
+  const seen = new Set<string>();
+  return [...ddg, ...bing].filter((item) => {
+    const key = item.url || `${item.title}|${item.snippet}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function fetchPublicSource(url: string, ownerName: string) {
+  try {
+    const response = await fetch(url, {
+      redirect: "follow",
+      cache: "no-store",
+      signal: AbortSignal.timeout(7000),
+      headers: searchHeaders,
+    });
+    if (!response.ok) return { phones: [] as string[], emails: [] as string[] };
+    const html = await response.text();
+    const $ = cheerio.load(html);
+    $("script,style,noscript,svg").remove();
+    const visible = $("body").text().replace(/\s+/g, " ");
+    return extractVerifiedContacts(visible, ownerName);
+  } catch {
+    return { phones: [] as string[], emails: [] as string[] };
+  }
+}
+
 export async function findOwnerCandidates(business: Business): Promise<OwnerCandidate[]> {
   if (!business.name) return [];
   const location = business.address ? ` ${business.address}` : "";
   const queries = [
     `"${business.name}" owner${location}`,
-    `"${business.name}" founder${location}`,
     `"${business.name}" president${location}`,
+    `"${business.name}" founder${location}`,
     `"${business.name}" "managing member"${location}`,
   ];
 
   const pages: SearchResult[] = [];
   for (const query of queries) {
-    const results = await duckDuckGoSearch(query);
+    const results = await searchOwnerWeb(query);
     pages.push(...results);
-    if (results.length) await new Promise((resolve) => setTimeout(resolve, 250));
+    await new Promise((resolve) => setTimeout(resolve, 180));
   }
 
   const candidates = new Map<string, OwnerCandidate>();
 
+  // Owner discovery is intentionally independent from phone/email enrichment.
   for (const result of pages) {
     const combined = `${result.title}. ${result.snippet}`;
     const people = extractPeopleNearRoles(combined, business.name);
     for (const person of people) {
       const key = normalize(person.name);
-      const snippetContact = extractVerifiedContacts(combined, person.name);
-      const source = {
-        label: result.title,
-        url: result.url,
-        snippet: result.snippet,
-        phones: snippetContact.phones,
-        emails: snippetContact.emails,
-      };
+      const source = { label: result.title, url: result.url, snippet: result.snippet, phones: [] as string[], emails: [] as string[] };
       const existing = candidates.get(key);
+
       if (existing) {
         if (!existing.sources.some((item) => item.url === source.url)) existing.sources.push(source);
-        existing.phones = uniq([...existing.phones, ...snippetContact.phones]);
-        existing.emails = uniq([...existing.emails, ...snippetContact.emails]);
         existing.confidence = Math.min(98, existing.confidence + 18);
       } else {
         let confidence = 64;
         if (/bbb|bizapedia|opencorporates|crunchbase|linkedin/i.test(`${result.title} ${result.url}`)) confidence += 8;
         if (normalize(combined).includes(normalize(business.name))) confidence += 8;
+        if (result.engine === "bing") confidence += 2;
         candidates.set(key, {
           name: person.name,
           title: person.title,
           confidence: Math.min(confidence, 90),
-          phones: snippetContact.phones,
-          emails: snippetContact.emails,
+          phones: [],
+          emails: [],
           sources: [source],
         });
       }
@@ -241,13 +268,15 @@ export async function findOwnerCandidates(business: Business): Promise<OwnerCand
     .sort((a, b) => b.confidence - a.confidence || b.sources.length - a.sources.length)
     .slice(0, 5);
 
+  // Only after the owner is known do we attempt verified contact enrichment.
   for (const candidate of ranked) {
     for (const source of candidate.sources.slice(0, 3)) {
-      const contact = await fetchPublicSource(source.url, candidate.name);
-      source.phones = uniq([...(source.phones || []), ...contact.phones]);
-      source.emails = uniq([...(source.emails || []), ...contact.emails]);
-      candidate.phones = uniq([...candidate.phones, ...contact.phones]);
-      candidate.emails = uniq([...candidate.emails, ...contact.emails]);
+      const snippetContact = extractVerifiedContacts(`${source.label}. ${source.snippet || ""}`, candidate.name);
+      const pageContact = await fetchPublicSource(source.url, candidate.name);
+      source.phones = uniq([...snippetContact.phones, ...pageContact.phones]);
+      source.emails = uniq([...snippetContact.emails, ...pageContact.emails]);
+      candidate.phones = uniq([...candidate.phones, ...source.phones]);
+      candidate.emails = uniq([...candidate.emails, ...source.emails]);
     }
     if (candidate.phones.length || candidate.emails.length) candidate.confidence = Math.min(98, candidate.confidence + 3);
   }
