@@ -219,6 +219,9 @@ export async function findOwnerCandidatesWithDebug(business: Business): Promise<
     const directQueries = [
       `"${candidate.name}" "${business.name}" phone`,
       `"${candidate.name}" "${business.name}" email`,
+      `site:einpresswire.com "${candidate.name}" "${business.name}"`,
+      `site:prnewswire.com "${candidate.name}" "${business.name}"`,
+      `site:prweb.com "${candidate.name}" "${business.name}"`,
     ];
     const directSearches = await Promise.all(directQueries.map(searchBoth));
     const directResults = directSearches.flatMap((item) => item.combined).filter((result) => isExternalSource(result.url));
@@ -229,7 +232,7 @@ export async function findOwnerCandidatesWithDebug(business: Business): Promise<
       candidate.phones = uniq([...candidate.phones, ...strict.phones]); candidate.emails = uniq([...candidate.emails, ...strict.emails]);
     }
 
-    await Promise.all(directResults.slice(0, 6).map(async (result) => {
+    await Promise.all(directResults.slice(0, 10).map(async (result) => {
       const snippetText = `${result.title}. ${result.snippet}`;
       const snippetContact = extractOwnerContactsStrict(snippetText, candidate.name, business.name!);
       let pageContact = { phones: [] as string[], emails: [] as string[] };
