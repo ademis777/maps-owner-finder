@@ -8,8 +8,15 @@ export type OwnerCandidate = {
   sources: Array<{ label: string; url: string; snippet?: string }>;
 };
 
-const rolePattern = /(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)/i;
+const roleSource = "[Oo]wner|[Ff]ounder|[Cc]o-[Ff]ounder|[Pp]resident|CEO|[Cc]eo|[Mm]anaging [Mm]ember|[Mm]ember|[Pp]rincipal|[Pp]roprietor";
+const rolePattern = new RegExp(`^(?:${roleSource})$`);
 const personName = `[A-Z][a-zA-Z'.-]+(?:\\s+[A-Z][a-zA-Z'.-]+){1,2}`;
+
+const blockedWords = new Set([
+  "because", "for", "from", "with", "about", "the", "and", "or", "of", "in", "at", "to", "as", "is",
+  "company", "business", "service", "services", "locksmith", "roofing", "plumbing", "principal", "agent",
+  "discover", "registered", "customer", "profile", "contact", "information", "providing", "excellent",
+]);
 
 const blockedPhrases = [
   "google maps",
@@ -23,8 +30,6 @@ const blockedPhrases = [
   "company profile",
   "business profile",
   "contact information",
-  "houston locksmith",
-  "texas premier locksmith",
 ];
 
 function normalize(value: string) {
@@ -32,26 +37,38 @@ function normalize(value: string) {
 }
 
 function looksLikePerson(name: string, businessName: string) {
-  const normalized = normalize(name);
+  const trimmed = name.trim().replace(/[.,;:]+$/g, "");
+  const normalized = normalize(trimmed);
   const businessNormalized = normalize(businessName);
+
   if (!normalized || normalized === businessNormalized) return false;
   if (businessNormalized.includes(normalized) || normalized.includes(businessNormalized)) return false;
   if (blockedPhrases.some((phrase) => normalized.includes(phrase))) return false;
 
-  const words = name.trim().split(/\s+/);
+  const words = trimmed.split(/\s+/);
   if (words.length < 2 || words.length > 3) return false;
-  if (words.some((word) => word.length < 2)) return false;
-  if (words.some((word) => /^(company|business|service|services|locksmith|roofing|plumbing|principal|agent)$/i.test(word))) return false;
+
+  // Every token must actually look like a proper-name token. Do not use an
+  // /i regex here: it was the reason phrases such as "because" were accepted.
+  if (words.some((word) => !/^[A-Z][a-zA-Z'.-]+$/.test(word))) return false;
+  if (words.some((word) => blockedWords.has(word.toLowerCase()))) return false;
+
+  // Avoid obvious all-caps acronyms and business/legal suffixes.
+  if (words.some((word) => /^(LLC|INC|CORP|LTD|CO)$/i.test(word))) return false;
+
   return true;
 }
 
 function extractPeopleNearRoles(text: string, businessName: string) {
   const matches: Array<{ name: string; title: string }> = [];
 
+  // Deliberately case-sensitive for person names. Role variants are encoded
+  // explicitly in roleSource so lowercase prose cannot be mistaken for names.
   const patterns = [
-    new RegExp(`(${personName})\\s*[-–—,:|]\\s*(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)`, "gi"),
-    new RegExp(`(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)\\s*[-–—,:|]?\\s*(${personName})`, "gi"),
-    new RegExp(`(${personName})\\s+(?:is|as|serves as|works as)?\\s*(?:the\\s+)?(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)`, "gi"),
+    new RegExp(`(${personName})\\s*[-–—,:|]\\s*(${roleSource})`, "g"),
+    new RegExp(`(${roleSource})\\s*[-–—,:|]?\\s*(${personName})`, "g"),
+    new RegExp(`(${personName})\\s+(?:is|as|serves as|works as)?\\s*(?:the\\s+)?(${roleSource})`, "g"),
+    new RegExp(`(${personName})\\s*[-–—,:|]\\s*(?:the\\s+)?(${roleSource})\\s+(?:of|for|at)\\b`, "g"),
   ];
 
   for (const pattern of patterns) {
@@ -60,9 +77,9 @@ function extractPeopleNearRoles(text: string, businessName: string) {
       const first = match[1] || "";
       const second = match[2] || "";
       const firstIsRole = rolePattern.test(first);
-      const name = firstIsRole ? second : first;
-      const title = firstIsRole ? first : second;
-      if (looksLikePerson(name, businessName)) matches.push({ name: name.trim(), title: title.trim() });
+      const name = (firstIsRole ? second : first).trim();
+      const title = (firstIsRole ? first : second).trim();
+      if (looksLikePerson(name, businessName)) matches.push({ name, title });
     }
   }
 
