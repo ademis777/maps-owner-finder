@@ -84,7 +84,7 @@ function extractEmails(text: string) {
   return uniq(text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).filter((email) => !/example\.(com|org|net)$/i.test(email)).slice(0, 6);
 }
 
-function chunksAround(text: string, needle: string, radius = 220) {
+function chunksAround(text: string, needle: string, radius = 360) {
   const haystack = text.toLowerCase();
   const target = needle.toLowerCase();
   const chunks: string[] = [];
@@ -94,15 +94,21 @@ function chunksAround(text: string, needle: string, radius = 220) {
     if (index === -1) break;
     chunks.push(text.slice(Math.max(0, index - radius), Math.min(text.length, index + target.length + radius)));
     from = index + target.length;
-    if (chunks.length >= 6) break;
+    if (chunks.length >= 8) break;
   }
   return chunks;
 }
 
 function extractOwnerContactsStrict(text: string, ownerName: string, businessName: string) {
-  const businessNeedle = normalize(businessName);
-  const valid = chunksAround(text, ownerName, 240).filter((chunk) => normalize(chunk).includes(businessNeedle));
-  return { phones: uniq(valid.flatMap(extractPhones)), emails: uniq(valid.flatMap(extractEmails)) };
+  const normalizedText = normalize(text);
+  if (!normalizedText.includes(normalize(ownerName)) || !normalizedText.includes(normalize(businessName))) {
+    return { phones: [] as string[], emails: [] as string[] };
+  }
+  const ownerChunks = chunksAround(text, ownerName, 360);
+  return {
+    phones: uniq(ownerChunks.flatMap(extractPhones)),
+    emails: uniq(ownerChunks.flatMap(extractEmails)),
+  };
 }
 
 function isExternalSource(url: string) {
@@ -192,10 +198,6 @@ export async function findOwnerCandidatesWithDebug(business: Business): Promise<
 
     for (const result of entry.combined) {
       const text = `${result.title}. ${result.snippet}`;
-      if (isExternalSource(result.url) && normalize(text).includes(normalize(business.name))) {
-        businessContacts.phones = uniq([...businessContacts.phones, ...extractPhones(text)]);
-        businessContacts.emails = uniq([...businessContacts.emails, ...extractEmails(text)]);
-      }
       for (const person of extractPeopleNearRoles(text, business.name)) {
         const key = normalize(person.name);
         const source = { label: result.title, url: result.url, snippet: result.snippet, phones: [] as string[], emails: [] as string[] };
@@ -218,31 +220,70 @@ export async function findOwnerCandidatesWithDebug(business: Business): Promise<
   await Promise.all(ranked.map(async (candidate) => {
     const directQueries = [
       `"${candidate.name}" "${business.name}" phone`,
-      `"${candidate.name}" "${business.name}" email`,
+      `"${candidate.name}" "${business.name}" contact`,
       `site:einpresswire.com "${candidate.name}" "${business.name}"`,
       `site:prnewswire.com "${candidate.name}" "${business.name}"`,
       `site:prweb.com "${candidate.name}" "${business.name}"`,
+      `site:bbb.org "${candidate.name}" "${business.name}"`,
     ];
-    const directSearches = await Promise.all(directQueries.map(searchBoth));
-    const directResults = directSearches.flatMap((item) => item.combined).filter((result) => isExternalSource(result.url));
+
+    const directSearches = await Promise.all(directQueries.map(async (query) => ({ query, ...(await searchBoth(query)) })));
+    for (const entry of directSearches) {
+      debug.queries.push({
+        query: `[OWNER CONTACT] ${entry.query}`,
+        duckduckgoCount: entry.ddg.length,
+        bingCount: entry.bing.length,
+        results: entry.combined.map((result) => ({
+          engine: result.engine,
+          title: result.title,
+          url: result.url,
+          snippet: result.snippet,
+          extracted: extractPeopleNearRoles(`${result.title}. ${result.snippet}`, business.name!),
+        })),
+      });
+    }
+
+    const seenUrls = new Set<string>();
+    const directResults = directSearches
+      .flatMap((entry) => entry.combined)
+      .filter((result) => isExternalSource(result.url))
+      .filter((result) => {
+        const key = result.url.replace(/#.*$/, "");
+        if (seenUrls.has(key)) return false;
+        seenUrls.add(key);
+        return true;
+      });
 
     for (const source of candidate.sources.slice(0, 3)) {
       const strict = extractOwnerContactsStrict(`${source.label}. ${source.snippet || ""}`, candidate.name, business.name!);
-      source.phones = strict.phones; source.emails = strict.emails;
-      candidate.phones = uniq([...candidate.phones, ...strict.phones]); candidate.emails = uniq([...candidate.emails, ...strict.emails]);
+      source.phones = strict.phones;
+      source.emails = strict.emails;
+      candidate.phones = uniq([...candidate.phones, ...strict.phones]);
+      candidate.emails = uniq([...candidate.emails, ...strict.emails]);
     }
 
-    await Promise.all(directResults.slice(0, 10).map(async (result) => {
+    await Promise.all(directResults.slice(0, 12).map(async (result) => {
       const snippetText = `${result.title}. ${result.snippet}`;
-      const snippetContact = extractOwnerContactsStrict(snippetText, candidate.name, business.name!);
-      let pageContact = { phones: [] as string[], emails: [] as string[] };
-      if (!snippetContact.phones.length && !snippetContact.emails.length) {
+      let contact = extractOwnerContactsStrict(snippetText, candidate.name, business.name!);
+      if (!contact.phones.length && !contact.emails.length) {
         const visible = await fetchVisible(result.url);
-        if (visible) pageContact = extractOwnerContactsStrict(visible, candidate.name, business.name!);
+        if (visible) contact = extractOwnerContactsStrict(visible, candidate.name, business.name!);
       }
-      candidate.phones = uniq([...candidate.phones, ...snippetContact.phones, ...pageContact.phones]);
-      candidate.emails = uniq([...candidate.emails, ...snippetContact.emails, ...pageContact.emails]);
+      if (!contact.phones.length && !contact.emails.length) return;
+
+      candidate.phones = uniq([...candidate.phones, ...contact.phones]);
+      candidate.emails = uniq([...candidate.emails, ...contact.emails]);
+
+      const existingSource = candidate.sources.find((source) => source.url === result.url);
+      if (existingSource) {
+        existingSource.phones = uniq([...(existingSource.phones || []), ...contact.phones]);
+        existingSource.emails = uniq([...(existingSource.emails || []), ...contact.emails]);
+      } else {
+        candidate.sources.push({ label: result.title, url: result.url, snippet: result.snippet, phones: contact.phones, emails: contact.emails });
+      }
     }));
+
+    if (candidate.phones.length || candidate.emails.length) candidate.confidence = Math.min(98, candidate.confidence + 2);
   }));
 
   return { ownerCandidates: ranked, debug, businessContacts };
