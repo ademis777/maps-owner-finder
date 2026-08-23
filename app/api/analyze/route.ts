@@ -35,6 +35,7 @@ export async function POST(request: Request) {
     const ownerCandidates = await findOwnerCandidates(business);
 
     const warnings: string[] = [];
+    if (resolved.mapsFetchWarning) warnings.push(resolved.mapsFetchWarning);
     if (!resolved.phone && input.seed?.phone) warnings.push("Phone came from the uploaded CSV because Google Maps did not expose it in public HTML.");
     if (!resolved.website && input.seed?.website) warnings.push("Website came from the uploaded CSV because Google Maps did not expose it in public HTML.");
     if (!resolved.address && input.seed?.address) warnings.push("Address came from the uploaded CSV because Google Maps did not expose it in public HTML.");
