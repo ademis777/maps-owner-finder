@@ -32,13 +32,11 @@ export async function POST(request: Request) {
       category: prefer(resolved.category, input.seed?.category),
     };
 
-    const { ownerCandidates, debug, businessContacts } = await findOwnerCandidatesWithDebug(business);
-    if (!business.phone && businessContacts.phones.length) business.phone = businessContacts.phones[0];
+    const { ownerCandidates, debug } = await findOwnerCandidatesWithDebug(business);
 
     const warnings: string[] = [];
     if (resolved.mapsFetchWarning) warnings.push(resolved.mapsFetchWarning);
     if (!resolved.phone && input.seed?.phone) warnings.push("Phone came from the uploaded CSV because Google Maps did not expose it in public HTML.");
-    if (!resolved.phone && !input.seed?.phone && business.phone) warnings.push("Phone came from a matching external public business source because Google Maps did not expose it.");
     if (!resolved.website && input.seed?.website) warnings.push("Website came from the uploaded CSV because Google Maps did not expose it in public HTML.");
     if (!resolved.address && input.seed?.address) warnings.push("Address came from the uploaded CSV because Google Maps did not expose it in public HTML.");
     if (ownerCandidates.length === 0) warnings.push("No owner candidate was strong enough to return from the public search results checked.");
