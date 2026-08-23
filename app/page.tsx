@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useMemo, useState } from "react";
+import { ChangeEvent, FormEvent, useMemo, useRef, useState } from "react";
 
 type Analysis = {
   business: {
@@ -97,9 +97,12 @@ export default function Home() {
   const [data, setData] = useState<Analysis | null>(null);
   const [bulk, setBulk] = useState<BulkResult[]>([]);
   const [bulkRunning, setBulkRunning] = useState(false);
+  const [bulkMessage, setBulkMessage] = useState("");
   const [fileName, setFileName] = useState("");
+  const stopRequested = useRef(false);
 
   const completed = useMemo(() => bulk.filter((item) => item.status === "done").length, [bulk]);
+  const failed = useMemo(() => bulk.filter((item) => item.status === "error").length, [bulk]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -118,6 +121,8 @@ export default function Home() {
   async function loadCsv(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file) return;
+    stopRequested.current = false;
+    setBulkMessage("");
     setError("");
     setFileName(file.name);
     const rows = parseCsv(await file.text());
@@ -134,19 +139,42 @@ export default function Home() {
     setBulk(rows.filter((row) => row.gmaps_url?.trim()).map((row) => ({ row, status: "queued" })));
   }
 
+  function stopBulk() {
+    stopRequested.current = true;
+    setBulkMessage("Stopping after the current company finishes…");
+  }
+
   async function runBulk() {
     if (!bulk.length || bulkRunning) return;
+    stopRequested.current = false;
     setBulkRunning(true);
+    setBulkMessage("");
     setError("");
+    let consecutiveErrors = 0;
 
     for (let index = 0; index < bulk.length; index++) {
-      setBulk((current) => current.map((item, i) => i === index ? { ...item, status: "processing", error: undefined } : item));
+      if (stopRequested.current) {
+        setBulkMessage("Stopped manually. Click Resume to continue queued companies.");
+        break;
+      }
+
       const current = bulk[index];
+      if (current.status === "done") continue;
+
+      setBulk((items) => items.map((item, i) => i === index ? { ...item, status: "processing", error: undefined } : item));
       try {
         const analysis = await analyze(current.row.gmaps_url, current.row);
+        consecutiveErrors = 0;
         setBulk((items) => items.map((item, i) => i === index ? { ...item, status: "done", analysis } : item));
       } catch (err) {
+        consecutiveErrors++;
         setBulk((items) => items.map((item, i) => i === index ? { ...item, status: "error", error: err instanceof Error ? err.message : "Analysis failed" } : item));
+
+        if (consecutiveErrors >= 5) {
+          stopRequested.current = true;
+          setBulkMessage("Auto-stopped after 5 consecutive errors. This may indicate rate limiting, blocking, or a network/IP problem. You can resume later.");
+          break;
+        }
       }
     }
     setBulkRunning(false);
@@ -238,12 +266,14 @@ export default function Home() {
         </div>
 
         {fileName && <p className="fileName">{fileName} — {bulk.length} Google Maps links loaded</p>}
+        {bulkMessage && <div className="error">{bulkMessage}</div>}
 
         {bulk.length > 0 && (
           <>
             <div className="bulkActions">
-              <button className="button" onClick={runBulk} disabled={bulkRunning}>{bulkRunning ? `Processing ${completed}/${bulk.length}…` : `Run ${bulk.length} companies`}</button>
-              <button className="secondaryButton" onClick={exportCsv} disabled={!completed}>Export results CSV</button>
+              <button className="button" onClick={runBulk} disabled={bulkRunning}>{bulkRunning ? `Processing ${completed + failed}/${bulk.length}…` : (completed || failed ? `Resume (${completed + failed}/${bulk.length})` : `Run ${bulk.length} companies`)}</button>
+              {bulkRunning && <button className="secondaryButton" onClick={stopBulk}>Stop</button>}
+              <button className="secondaryButton" onClick={exportCsv} disabled={!completed && !failed}>Export results CSV</button>
             </div>
 
             <div className="tableWrap">
