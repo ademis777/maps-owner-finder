@@ -32,6 +32,16 @@ function nameFromMapsUrl(url: string) {
   } catch {}
 }
 
+function isGenericGoogleTitle(value?: string) {
+  const text = value?.trim().toLowerCase();
+  return !text || text === "google maps" || text === "google" || text.startsWith("google maps -");
+}
+
+function isGenericGoogleDescription(value?: string) {
+  const text = value?.trim().toLowerCase() || "";
+  return text.includes("find local businesses") && text.includes("driving directions");
+}
+
 export async function resolveGoogleMapsBusiness(inputUrl: string): Promise<Business> {
   const parsed = new URL(inputUrl);
   const host = parsed.hostname.toLowerCase();
@@ -64,21 +74,19 @@ export async function resolveGoogleMapsBusiness(inputUrl: string): Promise<Busin
     mapsFetchWarning = `Google Maps fetch failed (${reason}); continuing with data available in the URL/CSV.`;
   }
 
+  const urlName = nameFromMapsUrl(finalUrl) || nameFromMapsUrl(inputUrl);
+
   if (!html) {
-    return {
-      name: nameFromMapsUrl(finalUrl) || nameFromMapsUrl(inputUrl),
-      mapsUrl: finalUrl,
-      mapsFetchWarning,
-    };
+    return { name: urlName, mapsUrl: finalUrl, mapsFetchWarning };
   }
 
   const $ = cheerio.load(html);
-  const title = $("meta[property='og:title']").attr("content") || $("title").text();
-  const description = $("meta[property='og:description']").attr("content") || "";
+  const title = clean($("meta[property='og:title']").attr("content") || $("title").text());
+  const description = clean($("meta[property='og:description']").attr("content") || "") || "";
   const text = `${html}\n${description}`;
 
-  let name = clean(title)?.replace(/\s*-\s*Google Maps.*$/i, "").replace(/\s*·\s*Google.*$/i, "");
-  if (!name) name = nameFromMapsUrl(finalUrl) || nameFromMapsUrl(inputUrl);
+  const parsedTitle = title?.replace(/\s*-\s*Google Maps.*$/i, "").replace(/\s*·\s*Google.*$/i, "");
+  const name = isGenericGoogleTitle(title) || isGenericGoogleTitle(parsedTitle) ? urlName : (parsedTitle || urlName);
 
   const phone = firstMatch(text, [
     /\"formatted_phone_number\"\s*:\s*\"([^\"]+)\"/i,
@@ -90,7 +98,7 @@ export async function resolveGoogleMapsBusiness(inputUrl: string): Promise<Busin
     /\"streetAddress\"\s*:\s*\"([^\"]+)\"/i,
     /\"address\"\s*:\s*\{[^}]*\"streetAddress\"\s*:\s*\"([^\"]+)\"/i,
     /\"formatted_address\"\s*:\s*\"([^\"]+)\"/i,
-  ]) || clean(description.split("·")[0]);
+  ]) || (!isGenericGoogleDescription(description) ? clean(description.split("·")[0]) : undefined);
 
   const website = firstMatch(text, [
     /\"url\"\s*:\s*\"(https?:\\?\/\\?\/[^\"]+)\"\s*,\s*\"sameAs\"/i,
@@ -101,6 +109,10 @@ export async function resolveGoogleMapsBusiness(inputUrl: string): Promise<Busin
     /\"@type\"\s*:\s*\"([^\"]+)\"/i,
     /\"category\"\s*:\s*\"([^\"]+)\"/i,
   ]);
+
+  if (isGenericGoogleTitle(title)) {
+    mapsFetchWarning = mapsFetchWarning || "Google Maps returned only its generic shell page; using the company name from the Maps URL.";
+  }
 
   return { name, address, phone, website, category, mapsUrl: finalUrl, mapsFetchWarning };
 }
