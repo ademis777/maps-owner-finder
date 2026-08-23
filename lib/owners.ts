@@ -11,12 +11,13 @@ export type OwnerCandidate = {
 };
 
 type SearchResult = { title: string; url: string; snippet: string; engine: "duckduckgo" | "bing" };
-
 type SourcePage = { text: string; ok: boolean };
 
 const rolePattern = /(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)/i;
-const personName = `[A-Z][a-zA-Z'.-]+(?:\\s+[A-Z][a-zA-Z'.-]+){1,2}`;
-const blockedWords = new Set(["because", "for", "and", "the", "with", "from", "at", "of", "in", "to", "by", "is", "as", "a", "an", "no-brainer"]);
+const roleExpr = `[Oo]wner|[Ff]ounder|[Cc]o-[Ff]ounder|[Pp]resident|CEO|[Mm]anaging [Mm]ember|[Mm]ember|[Pp]rincipal|[Pp]roprietor`;
+const nameWord = `[A-Z][a-zA-Z'-]*`;
+const personName = `${nameWord}(?:\\s+${nameWord}){1,2}`;
+const blockedWords = new Set(["because", "for", "and", "the", "with", "from", "at", "of", "in", "to", "by", "is", "as", "a", "an", "no-brainer", "principal", "contacts", "customer", "business", "management"]);
 const blockedPhrases = ["google maps", "better business", "linkedin", "facebook", "yellow pages", "registered agent", "discover company principals", "customer service", "company profile", "business profile", "contact information"];
 
 const externalSourceDomains = [
@@ -46,17 +47,17 @@ function looksLikePerson(name: string, businessName: string) {
   const words = name.trim().split(/\s+/);
   if (words.length < 2 || words.length > 3) return false;
   if (words.some((word) => blockedWords.has(word.toLowerCase()))) return false;
-  if (words.some((word) => !/^[A-Z][a-zA-Z'.-]+$/.test(word))) return false;
+  if (words.some((word) => !/^[A-Z][a-zA-Z'-]*$/.test(word))) return false;
   return true;
 }
 
 function extractPeopleNearRoles(text: string, businessName: string) {
   const matches: Array<{ name: string; title: string }> = [];
   const patterns = [
-    new RegExp(`(${personName})\\s*[-–—,:|]\\s*(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)`, "g"),
-    new RegExp(`(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)\\s*[-–—,:|]?\\s*(?:mr\\.?|ms\\.?|mrs\\.?)?\\s*(${personName})`, "gi"),
-    new RegExp(`(?:mr\\.?|ms\\.?|mrs\\.?)?\\s*(${personName})\\s+(?:is|as|serves as|works as|,)?\\s*(?:the\\s+)?(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)`, "g"),
-    new RegExp(`(?:business management|principal contacts?|customer contacts?)\\s*[:\\-]?\\s*(?:mr\\.?|ms\\.?|mrs\\.?)?\\s*(${personName})\\s*,?\\s*(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)`, "gi"),
+    new RegExp(`(?:Mr\\.?|Ms\\.?|Mrs\\.?)?\\s*(${personName})\\s*[-–—,:|]\\s*(${roleExpr})\\b`, "g"),
+    new RegExp(`\\b(${roleExpr})\\b\\s*(?:of\\s+)?[-–—,:|]?\\s*(?:Mr\\.?|Ms\\.?|Mrs\\.?)?\\s*(${personName})\\b`, "g"),
+    new RegExp(`(?:Mr\\.?|Ms\\.?|Mrs\\.?)?\\s*(${personName})\\s+(?:is|was|serves as|works as)\\s+(?:the\\s+)?(${roleExpr})\\b`, "g"),
+    new RegExp(`(?:Mr\\.?|Ms\\.?|Mrs\\.?)?\\s*(${personName})\\s*,[^.!?]{0,70}?\\b(${roleExpr})\\b`, "g"),
   ];
 
   for (const pattern of patterns) {
@@ -65,9 +66,9 @@ function extractPeopleNearRoles(text: string, businessName: string) {
       const first = match[1] || "";
       const second = match[2] || "";
       const firstIsRole = rolePattern.test(first);
-      const name = firstIsRole ? second : first;
-      const title = firstIsRole ? first : second;
-      if (looksLikePerson(name, businessName)) matches.push({ name: name.trim(), title: title.trim() });
+      const name = (firstIsRole ? second : first).trim();
+      const title = (firstIsRole ? first : second).trim();
+      if (looksLikePerson(name, businessName)) matches.push({ name, title });
     }
   }
 
@@ -311,13 +312,11 @@ export async function findOwnerCandidates(business: Business): Promise<OwnerCand
     });
   }
 
-  // Pass 1: fast extraction from search result titles/snippets.
   for (const result of uniquePages.values()) {
     const combined = `${result.title}. ${result.snippet}`;
     for (const person of extractPeopleNearRoles(combined, business.name)) addCandidate(person, result);
   }
 
-  // Pass 2: deep parse trusted external sources. This does not use company websites.
   const externalPages = [...uniquePages.values()].filter((result) => isExternalSource(result.url)).slice(0, 16);
   for (const result of externalPages) {
     const page = await fetchSourcePage(result.url);
@@ -331,7 +330,6 @@ export async function findOwnerCandidates(business: Business): Promise<OwnerCand
     .sort((a, b) => b.confidence - a.confidence || b.sources.length - a.sources.length)
     .slice(0, 5);
 
-  // Contact enrichment stays separate and can never remove an owner candidate.
   for (const candidate of ranked) {
     for (const source of candidate.sources.slice(0, 4)) {
       const snippetText = `${source.label}. ${source.snippet || ""}`;
