@@ -8,8 +8,66 @@ export type OwnerCandidate = {
   sources: Array<{ label: string; url: string; snippet?: string }>;
 };
 
-const titlePattern = /(owner|founder|co-founder|president|ceo|managing member|principal|proprietor)/i;
-const personPattern = /\b([A-Z][a-z]+(?:\s+[A-Z][a-z'.-]+){1,2})\b/;
+const rolePattern = /(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)/i;
+const personName = `[A-Z][a-zA-Z'.-]+(?:\\s+[A-Z][a-zA-Z'.-]+){1,2}`;
+
+const blockedPhrases = [
+  "google maps",
+  "better business",
+  "linkedin",
+  "facebook",
+  "yellow pages",
+  "registered agent",
+  "discover company principals",
+  "customer service",
+  "company profile",
+  "business profile",
+  "contact information",
+  "houston locksmith",
+  "texas premier locksmith",
+];
+
+function normalize(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function looksLikePerson(name: string, businessName: string) {
+  const normalized = normalize(name);
+  const businessNormalized = normalize(businessName);
+  if (!normalized || normalized === businessNormalized) return false;
+  if (businessNormalized.includes(normalized) || normalized.includes(businessNormalized)) return false;
+  if (blockedPhrases.some((phrase) => normalized.includes(phrase))) return false;
+
+  const words = name.trim().split(/\s+/);
+  if (words.length < 2 || words.length > 3) return false;
+  if (words.some((word) => word.length < 2)) return false;
+  if (words.some((word) => /^(company|business|service|services|locksmith|roofing|plumbing|principal|agent)$/i.test(word))) return false;
+  return true;
+}
+
+function extractPeopleNearRoles(text: string, businessName: string) {
+  const matches: Array<{ name: string; title: string }> = [];
+
+  const patterns = [
+    new RegExp(`(${personName})\\s*[-–—,:|]\\s*(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)`, "gi"),
+    new RegExp(`(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)\\s*[-–—,:|]?\\s*(${personName})`, "gi"),
+    new RegExp(`(${personName})\\s+(?:is|as|serves as|works as)?\\s*(?:the\\s+)?(owner|founder|co-founder|president|ceo|managing member|member|principal|proprietor)`, "gi"),
+  ];
+
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text))) {
+      const first = match[1] || "";
+      const second = match[2] || "";
+      const firstIsRole = rolePattern.test(first);
+      const name = firstIsRole ? second : first;
+      const title = firstIsRole ? first : second;
+      if (looksLikePerson(name, businessName)) matches.push({ name: name.trim(), title: title.trim() });
+    }
+  }
+
+  return matches;
+}
 
 async function duckDuckGoSearch(query: string) {
   const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
@@ -20,7 +78,7 @@ async function duckDuckGoSearch(query: string) {
   if (!response.ok) return [];
   const $ = cheerio.load(await response.text());
   const results: Array<{ title: string; url: string; snippet: string }> = [];
-  $(".result").slice(0, 8).each((_, element) => {
+  $(".result").slice(0, 10).each((_, element) => {
     const title = $(element).find(".result__a").text().trim();
     const href = $(element).find(".result__a").attr("href") || "";
     const snippet = $(element).find(".result__snippet").text().replace(/\s+/g, " ").trim();
@@ -37,6 +95,7 @@ export async function findOwnerCandidates(business: Business): Promise<OwnerCand
     `"${business.name}" owner${location}`,
     `"${business.name}" founder${location}`,
     `"${business.name}" president${location}`,
+    `"${business.name}" "managing member"${location}`,
   ];
 
   const pages = (await Promise.all(queries.map(duckDuckGoSearch))).flat();
@@ -44,23 +103,25 @@ export async function findOwnerCandidates(business: Business): Promise<OwnerCand
 
   for (const result of pages) {
     const combined = `${result.title}. ${result.snippet}`;
-    const titleMatch = combined.match(titlePattern);
-    if (!titleMatch) continue;
+    const people = extractPeopleNearRoles(combined, business.name);
 
-    const people = combined.match(new RegExp(personPattern.source, "g")) || [];
-    for (const name of people.slice(0, 3)) {
-      if (/Google Maps|Better Business|LinkedIn|Facebook|Yellow Pages/i.test(name)) continue;
-      const key = name.toLowerCase();
-      const existing = candidates.get(key);
+    for (const person of people) {
+      const key = normalize(person.name);
       const source = { label: result.title, url: result.url, snippet: result.snippet };
+      const existing = candidates.get(key);
+
       if (existing) {
         if (!existing.sources.some((item) => item.url === source.url)) existing.sources.push(source);
-        existing.confidence = Math.min(95, existing.confidence + 18);
+        existing.confidence = Math.min(98, existing.confidence + 18);
+        if (!existing.title && person.title) existing.title = person.title;
       } else {
+        let confidence = 64;
+        if (/linkedin|bbb|bizapedia|opencorporates|crunchbase/i.test(`${result.title} ${result.url}`)) confidence += 8;
+        if (normalize(combined).includes(normalize(business.name))) confidence += 8;
         candidates.set(key, {
-          name,
-          title: titleMatch[1],
-          confidence: 52,
+          name: person.name,
+          title: person.title,
+          confidence: Math.min(confidence, 90),
           sources: [source],
         });
       }
@@ -68,6 +129,7 @@ export async function findOwnerCandidates(business: Business): Promise<OwnerCand
   }
 
   return [...candidates.values()]
+    .filter((candidate) => candidate.confidence >= 60)
     .sort((a, b) => b.confidence - a.confidence || b.sources.length - a.sources.length)
     .slice(0, 5);
 }
