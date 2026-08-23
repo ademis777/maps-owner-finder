@@ -67,6 +67,32 @@ function extractEmails(text: string) {
   return uniq(matches).filter((email) => !/example\.(com|org|net)$/i.test(email)).slice(0, 6);
 }
 
+function extractNearby(text: string, needle: string, radius = 220) {
+  const haystack = text.toLowerCase();
+  const target = needle.toLowerCase();
+  const chunks: string[] = [];
+  let from = 0;
+  while (from < haystack.length) {
+    const index = haystack.indexOf(target, from);
+    if (index === -1) break;
+    const start = Math.max(0, index - radius);
+    const end = Math.min(text.length, index + target.length + radius);
+    chunks.push(text.slice(start, end));
+    from = index + target.length;
+    if (chunks.length >= 8) break;
+  }
+  return chunks.join(" ");
+}
+
+function extractVerifiedContacts(text: string, ownerName: string) {
+  const nearby = extractNearby(text, ownerName, 220);
+  if (!nearby) return { phones: [] as string[], emails: [] as string[] };
+  return {
+    phones: extractPhones(nearby),
+    emails: extractEmails(nearby),
+  };
+}
+
 function decodeDuckDuckGoUrl(href: string) {
   try {
     const url = new URL(href, "https://duckduckgo.com");
@@ -77,7 +103,7 @@ function decodeDuckDuckGoUrl(href: string) {
   }
 }
 
-async function fetchPublicSource(url: string) {
+async function fetchPublicSource(url: string, ownerName: string) {
   try {
     const response = await fetch(url, {
       redirect: "follow",
@@ -93,8 +119,7 @@ async function fetchPublicSource(url: string) {
     const $ = cheerio.load(html);
     $("script,style,noscript,svg").remove();
     const visible = $("body").text().replace(/\s+/g, " ");
-    const combined = `${visible} ${html}`;
-    return { phones: extractPhones(combined), emails: extractEmails(combined) };
+    return extractVerifiedContacts(visible, ownerName);
   } catch {
     return { phones: [] as string[], emails: [] as string[] };
   }
@@ -176,20 +201,24 @@ export async function findOwnerCandidates(business: Business): Promise<OwnerCand
 
   const candidates = new Map<string, OwnerCandidate>();
 
-  // Discovery first: candidates are saved from search results even if source pages later block us.
   for (const result of pages) {
     const combined = `${result.title}. ${result.snippet}`;
     const people = extractPeopleNearRoles(combined, business.name);
     for (const person of people) {
       const key = normalize(person.name);
-      const snippetPhones = extractPhones(combined);
-      const snippetEmails = extractEmails(combined);
-      const source = { label: result.title, url: result.url, snippet: result.snippet, phones: snippetPhones, emails: snippetEmails };
+      const snippetContact = extractVerifiedContacts(combined, person.name);
+      const source = {
+        label: result.title,
+        url: result.url,
+        snippet: result.snippet,
+        phones: snippetContact.phones,
+        emails: snippetContact.emails,
+      };
       const existing = candidates.get(key);
       if (existing) {
         if (!existing.sources.some((item) => item.url === source.url)) existing.sources.push(source);
-        existing.phones = uniq([...existing.phones, ...snippetPhones]);
-        existing.emails = uniq([...existing.emails, ...snippetEmails]);
+        existing.phones = uniq([...existing.phones, ...snippetContact.phones]);
+        existing.emails = uniq([...existing.emails, ...snippetContact.emails]);
         existing.confidence = Math.min(98, existing.confidence + 18);
       } else {
         let confidence = 64;
@@ -199,8 +228,8 @@ export async function findOwnerCandidates(business: Business): Promise<OwnerCand
           name: person.name,
           title: person.title,
           confidence: Math.min(confidence, 90),
-          phones: snippetPhones,
-          emails: snippetEmails,
+          phones: snippetContact.phones,
+          emails: snippetContact.emails,
           sources: [source],
         });
       }
@@ -212,10 +241,9 @@ export async function findOwnerCandidates(business: Business): Promise<OwnerCand
     .sort((a, b) => b.confidence - a.confidence || b.sources.length - a.sources.length)
     .slice(0, 5);
 
-  // Enrichment second: failure here never removes a discovered owner.
   for (const candidate of ranked) {
     for (const source of candidate.sources.slice(0, 3)) {
-      const contact = await fetchPublicSource(source.url);
+      const contact = await fetchPublicSource(source.url, candidate.name);
       source.phones = uniq([...(source.phones || []), ...contact.phones]);
       source.emails = uniq([...(source.emails || []), ...contact.emails]);
       candidate.phones = uniq([...candidate.phones, ...contact.phones]);
