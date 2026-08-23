@@ -13,6 +13,20 @@ type Analysis = {
     sources: Array<{ label: string; url: string; snippet?: string; phones?: string[]; emails?: string[] }>;
   }>;
   warnings: string[];
+  debug?: {
+    queries: Array<{
+      query: string;
+      duckduckgoCount: number;
+      bingCount: number;
+      results: Array<{
+        engine: "duckduckgo" | "bing";
+        title: string;
+        url: string;
+        snippet: string;
+        extracted: Array<{ name: string; title: string }>;
+      }>;
+    }>;
+  };
 };
 
 type CsvRow = Record<string, string>;
@@ -101,6 +115,15 @@ export default function Home() {
           </div>
           <div className="sources" style={{ marginTop: 10 }}>{candidate.sources.map((source) => <div key={source.url}><a href={source.url} target="_blank" rel="noreferrer">{source.label}</a>{(source.phones?.length || source.emails?.length) ? <div className="note">Parsed: {[...(source.phones || []), ...(source.emails || [])].join(" · ")}</div> : null}</div>)}</div>
         </div>)}</article>
+
+        {data.debug && <article className="card"><h2>Debug search log</h2><p className="note">Send me a screenshot of this block if owner discovery fails.</p>{data.debug.queries.map((entry, qIndex) => <details key={`${entry.query}-${qIndex}`} style={{ marginBottom: 12 }} open={qIndex === 0}>
+          <summary style={{ cursor: "pointer", fontWeight: 700 }}>{entry.query} — DDG {entry.duckduckgoCount}, Bing {entry.bingCount}</summary>
+          <div style={{ marginTop: 10 }}>{entry.results.length === 0 ? <div className="note">No search results returned.</div> : entry.results.map((result, rIndex) => <div className="source" key={`${result.url}-${rIndex}`}>
+            <strong>[{result.engine}] {result.title}</strong>
+            <div className="note" style={{ marginTop: 6 }}>{result.snippet || "No snippet"}</div>
+            <div className="note" style={{ marginTop: 6 }}>Extracted: {result.extracted.length ? result.extracted.map((person) => `${person.name} (${person.title})`).join(" | ") : "none"}</div>
+          </div>)}</div>
+        </details>)}</article>}
       </div>}
     </section>
 
