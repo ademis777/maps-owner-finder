@@ -7,6 +7,7 @@ export type Business = {
   website?: string;
   category?: string;
   mapsUrl: string;
+  mapsFetchWarning?: string;
 };
 
 function clean(value?: string | null) {
@@ -20,6 +21,17 @@ function firstMatch(text: string, patterns: RegExp[]) {
   }
 }
 
+function nameFromMapsUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    const placePart = parsed.pathname.split("/place/")[1]?.split("/")[0];
+    if (placePart) return clean(decodeURIComponent(placePart).replace(/\+/g, " "));
+
+    const query = parsed.searchParams.get("query") || parsed.searchParams.get("q");
+    if (query) return clean(decodeURIComponent(query).replace(/\+/g, " "));
+  } catch {}
+}
+
 export async function resolveGoogleMapsBusiness(inputUrl: string): Promise<Business> {
   const parsed = new URL(inputUrl);
   const host = parsed.hostname.toLowerCase();
@@ -27,31 +39,46 @@ export async function resolveGoogleMapsBusiness(inputUrl: string): Promise<Busin
     throw new Error("Please paste a Google Maps company link.");
   }
 
-  const response = await fetch(inputUrl, {
-    redirect: "follow",
-    cache: "no-store",
-    headers: {
-      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
-      "accept-language": "en-US,en;q=0.9",
-    },
-  });
+  let finalUrl = inputUrl;
+  let html = "";
+  let mapsFetchWarning: string | undefined;
 
-  if (!response.ok) throw new Error(`Google Maps returned HTTP ${response.status}.`);
+  try {
+    const response = await fetch(inputUrl, {
+      redirect: "follow",
+      cache: "no-store",
+      headers: {
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+        "accept-language": "en-US,en;q=0.9",
+      },
+    });
 
-  const finalUrl = response.url || inputUrl;
-  const html = await response.text();
+    if (!response.ok) {
+      mapsFetchWarning = `Google Maps returned HTTP ${response.status}; continuing with data available in the URL/CSV.`;
+    } else {
+      finalUrl = response.url || inputUrl;
+      html = await response.text();
+    }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "request failed";
+    mapsFetchWarning = `Google Maps fetch failed (${reason}); continuing with data available in the URL/CSV.`;
+  }
+
+  if (!html) {
+    return {
+      name: nameFromMapsUrl(finalUrl) || nameFromMapsUrl(inputUrl),
+      mapsUrl: finalUrl,
+      mapsFetchWarning,
+    };
+  }
+
   const $ = cheerio.load(html);
   const title = $("meta[property='og:title']").attr("content") || $("title").text();
   const description = $("meta[property='og:description']").attr("content") || "";
   const text = `${html}\n${description}`;
 
   let name = clean(title)?.replace(/\s*-\s*Google Maps.*$/i, "").replace(/\s*·\s*Google.*$/i, "");
-  if (!name) {
-    try {
-      const urlName = decodeURIComponent(new URL(finalUrl).pathname.split("/place/")[1]?.split("/")[0] || "").replace(/\+/g, " ");
-      name = clean(urlName);
-    } catch {}
-  }
+  if (!name) name = nameFromMapsUrl(finalUrl) || nameFromMapsUrl(inputUrl);
 
   const phone = firstMatch(text, [
     /\"formatted_phone_number\"\s*:\s*\"([^\"]+)\"/i,
@@ -75,5 +102,5 @@ export async function resolveGoogleMapsBusiness(inputUrl: string): Promise<Busin
     /\"category\"\s*:\s*\"([^\"]+)\"/i,
   ]);
 
-  return { name, address, phone, website, category, mapsUrl: finalUrl };
+  return { name, address, phone, website, category, mapsUrl: finalUrl, mapsFetchWarning };
 }
