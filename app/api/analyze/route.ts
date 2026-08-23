@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { resolveGoogleMapsBusiness } from "@/lib/maps";
-import { findOwnerCandidates } from "@/lib/owners";
+import { findOwnerCandidatesWithDebug } from "@/lib/owners";
 
 const Input = z.object({
   url: z.string().url(),
@@ -32,7 +32,7 @@ export async function POST(request: Request) {
       category: prefer(resolved.category, input.seed?.category),
     };
 
-    const ownerCandidates = await findOwnerCandidates(business);
+    const { ownerCandidates, debug } = await findOwnerCandidatesWithDebug(business);
 
     const warnings: string[] = [];
     if (resolved.mapsFetchWarning) warnings.push(resolved.mapsFetchWarning);
@@ -41,7 +41,7 @@ export async function POST(request: Request) {
     if (!resolved.address && input.seed?.address) warnings.push("Address came from the uploaded CSV because Google Maps did not expose it in public HTML.");
     if (ownerCandidates.length === 0) warnings.push("No owner candidate was strong enough to return from the public search results checked.");
 
-    return NextResponse.json({ business, ownerCandidates, warnings });
+    return NextResponse.json({ business, ownerCandidates, warnings, debug });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unable to analyze this company.";
     return NextResponse.json({ error: message }, { status: 400 });
