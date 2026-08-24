@@ -1,118 +1,86 @@
 import * as cheerio from "cheerio";
 
+export type MapsStatus = "resolved" | "partial" | "shell_only" | "blocked" | "timeout" | "error";
+export type MapsFieldSource = "url" | "redirect_url" | "meta" | "json_ld" | "embedded_payload" | "seed";
+export type MapsFieldName = "name" | "address" | "city" | "state" | "zip" | "phone" | "website" | "category";
+export type MapsFieldEvidence = { value: string; source: MapsFieldSource; confidence: number; evidence?: string };
+export type MapsStrategyDebug = { strategy: "url" | "redirect_url" | "html_metadata" | "json_ld" | "embedded_payload"; status: "resolved" | "partial" | "empty" | "skipped" | "blocked" | "timeout" | "error"; fieldsFound: MapsFieldName[]; durationMs: number; reason?: string };
+
 export type Business = {
-  name?: string;
-  address?: string;
-  phone?: string;
-  website?: string;
-  category?: string;
-  mapsUrl: string;
-  mapsFetchWarning?: string;
+  name?: string; address?: string; city?: string; state?: string; zip?: string; phone?: string; website?: string; category?: string;
+  mapsUrl: string; mapsInputUrl?: string; mapsFetchWarning?: string; mapsStatus: MapsStatus; mapsHttpStatus?: number; mapsStatusReason?: string;
+  mapsStrategies?: MapsStrategyDebug[]; mapsFieldEvidence?: Partial<Record<MapsFieldName, MapsFieldEvidence>>;
+  coordinates?: { latitude: number; longitude: number }; placeId?: string; mapsAddressParseError?: string;
 };
 
-function clean(value?: string | null) {
-  return value?.replace(/\\u0026/g, "&").replace(/\\u003d/g, "=").replace(/\\u002f/g, "/").replace(/\\n/g, " ").trim();
+type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
+type FieldCandidates = Partial<Record<MapsFieldName, MapsFieldEvidence[]>>;
+type ParsedFields = Partial<Record<MapsFieldName, string>> & { coordinates?: Business["coordinates"]; placeId?: string; canonicalUrl?: string };
+
+const US_STATES: Record<string, string> = {
+  ALABAMA:"AL",ALASKA:"AK",ARIZONA:"AZ",ARKANSAS:"AR",CALIFORNIA:"CA",COLORADO:"CO",CONNECTICUT:"CT",DELAWARE:"DE",FLORIDA:"FL",GEORGIA:"GA",HAWAII:"HI",IDAHO:"ID",ILLINOIS:"IL",INDIANA:"IN",IOWA:"IA",KANSAS:"KS",KENTUCKY:"KY",LOUISIANA:"LA",MAINE:"ME",MARYLAND:"MD",MASSACHUSETTS:"MA",MICHIGAN:"MI",MINNESOTA:"MN",MISSISSIPPI:"MS",MISSOURI:"MO",MONTANA:"MT",NEBRASKA:"NE",NEVADA:"NV","NEW HAMPSHIRE":"NH","NEW JERSEY":"NJ","NEW MEXICO":"NM","NEW YORK":"NY","NORTH CAROLINA":"NC","NORTH DAKOTA":"ND",OHIO:"OH",OKLAHOMA:"OK",OREGON:"OR",PENNSYLVANIA:"PA","RHODE ISLAND":"RI","SOUTH CAROLINA":"SC","SOUTH DAKOTA":"SD",TENNESSEE:"TN",TEXAS:"TX",UTAH:"UT",VERMONT:"VT",VIRGINIA:"VA",WASHINGTON:"WA","WEST VIRGINIA":"WV",WISCONSIN:"WI",WYOMING:"WY","DISTRICT OF COLUMBIA":"DC",
+};
+const STATE_CODES = new Set(Object.values(US_STATES));
+const FIELD_NAMES = ["name","address","city","state","zip","phone","website","category"] as const;
+
+function clean(value?: string | null) { return value?.replace(/\\u0026/gi,"&").replace(/\\u003d/gi,"=").replace(/\\u002f/gi,"/").replace(/\\n/g," ").replace(/\s+/g," ").trim(); }
+function decodePathPart(value: string) { try { return clean(decodeURIComponent(value).replace(/\+/g," ")); } catch { return clean(value.replace(/\+/g," ")); } }
+function normalizeText(value?: string) { return (value||"").toLowerCase().replace(/&/g," and ").replace(/[^a-z0-9]+/g," ").trim(); }
+function tokens(value?: string) { return normalizeText(value).split(" ").filter((token)=>token.length>1&&!["the","and","llc","inc","corp","company","co"].includes(token)); }
+function nameSimilarity(candidate:string,hint:string) { const a=tokens(candidate),b=tokens(hint),setB=new Set(b);return!a.length||!b.length?0:a.filter((token)=>setB.has(token)).length/Math.max(a.length,b.length); }
+function stateHint(value?:string){const normalized=(value||"").toUpperCase();for(const [name,code] of Object.entries(US_STATES))if(new RegExp(`\\b${name}\\b`).test(normalized))return code;const code=normalized.match(new RegExp(`\\b(${[...STATE_CODES].join("|")})\\b`))?.[1];return code;}
+
+export function parseAddressParts(address?:string):{city?:string;state?:string;zip?:string;error?:string}{
+  const text=clean(address); if(!text)return{}; const zip=text.match(/\b(\d{5})(?:-\d{4})?\b/)?.[1];
+  const statePattern=Object.keys(US_STATES).sort((a,b)=>b.length-a.length).join("|");
+  const codeMatch=text.match(new RegExp(`(?:,|\\s)(${[...STATE_CODES].join("|")})\\s+\\d{5}\\b`,"i"));
+  const nameMatch=text.match(new RegExp(`(?:,|\\s)(${statePattern})\\s+\\d{5}\\b`,"i"));
+  const selected=codeMatch||nameMatch;const raw=selected?.[1]?.toUpperCase(); const state=raw?(STATE_CODES.has(raw)?raw:US_STATES[raw]):undefined;
+  const city=selected?.index!==undefined?clean(text.slice(0,selected.index).split(",").map(part=>part.trim()).filter(Boolean).at(-1)):undefined;
+  return{city,state,zip,error:!state?"A full address was found, but its US state could not be parsed.":undefined};
 }
 
-function firstMatch(text: string, patterns: RegExp[]) {
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match?.[1]) return clean(match[1]);
-  }
+export function parseMapsUrl(url:string):ParsedFields{
+  try{const parsed=new URL(url);const preview=parsed.pathname.includes("/maps/preview/place/");const part=parsed.pathname.match(/\/maps\/(?:preview\/)?(?:place|search)\/([^/]+)/i)?.[1];const query=parsed.searchParams.get("query")||parsed.searchParams.get("q");const decoded=part?decodePathPart(part):query?decodePathPart(query):undefined;let name=decoded,address:string|undefined;if(preview&&decoded){const match=decoded.match(/^(.+?),\s*((?:\d+|[A-Z]-?\d+)\s+.+?,\s*[^,]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)(?:,.*)?$/i);if(match){name=clean(match[1]);address=clean(match[2]);}}const p=parseAddressParts(address);const coord=`${parsed.pathname}${parsed.search}`.match(/@(-?\d{1,3}\.\d+),(-?\d{1,3}\.\d+)/);const placeId=`${parsed.pathname}${parsed.search}`.match(/!1s([^!]+)/)?.[1]||parsed.searchParams.get("query_place_id")||undefined;return{name,address,city:p.city,state:p.state,zip:p.zip,coordinates:coord?{latitude:Number(coord[1]),longitude:Number(coord[2])}:undefined,placeId:placeId?decodePathPart(placeId):undefined};}catch{return{};}
 }
 
-function nameFromMapsUrl(url: string) {
-  try {
-    const parsed = new URL(url);
-    const placePart = parsed.pathname.split("/place/")[1]?.split("/")[0];
-    if (placePart) return clean(decodeURIComponent(placePart).replace(/\+/g, " "));
+function addCandidate(target:FieldCandidates,field:MapsFieldName,value:string|undefined,source:MapsFieldSource,confidence:number,evidence?:string){const v=clean(value);if(v)(target[field]||=[]).push({value:v,source,confidence,evidence});}
+function addParsed(target:FieldCandidates,parsed:ParsedFields,source:MapsFieldSource,confidence:number,evidence?:string){for(const field of FIELD_NAMES)addCandidate(target,field,parsed[field],source,confidence,evidence);}
 
-    const query = parsed.searchParams.get("query") || parsed.searchParams.get("q");
-    if (query) return clean(decodeURIComponent(query).replace(/\+/g, " "));
-  } catch {}
+function parseJsonLd($:cheerio.CheerioAPI):ParsedFields[]{const found:ParsedFields[]=[];$("script[type='application/ld+json']").each((_,el)=>{try{const raw=JSON.parse($(el).text());const nodes=Array.isArray(raw)?raw:raw?.["@graph"]||[raw];for(const node of nodes){if(!node||typeof node!=="object")continue;const a=typeof node.address==="object"?node.address:undefined;const address=typeof node.address==="string"?node.address:a?[a.streetAddress,a.addressLocality,a.addressRegion,a.postalCode].filter(Boolean).join(", "):undefined;found.push({name:node.name,address,city:a?.addressLocality,state:a?.addressRegion,zip:a?.postalCode,phone:node.telephone,website:node.url,category:Array.isArray(node["@type"])?node["@type"].at(-1):node["@type"]});}}catch{}});return found;}
+
+export function parseHtmlMetadata(html:string):{meta:ParsedFields;jsonLd:ParsedFields[];alternateUrl?:string;title?:string}{
+  const $=cheerio.load(html);const title=clean($("meta[property='og:title']").attr("content")||$("title").text());const description=clean($("meta[property='og:description']").attr("content")||$("meta[name='description']").attr("content"));const canonicalUrl=clean($("link[rel='canonical']").attr("href")||$("meta[property='og:url']").attr("content"));const parsedTitle=title?.replace(/\s*[-·]\s*Google Maps.*$/i,"");const generic=!parsedTitle||/^(google maps|google|карти google)$/i.test(parsedTitle.trim());let alternateUrl:string|undefined;
+  $("a[href],link[href]").each((_,el)=>{const href=$(el).attr("href");if(!alternateUrl&&href?.startsWith("/search?tbm=map"))alternateUrl=`https://www.google.com${href.replace(/&amp;/g,"&")}`;});
+  return{meta:{name:generic?undefined:parsedTitle,address:description&&!/find local businesses|знаходьте місцеві компанії/i.test(description)?description.split("·")[0]?.trim():undefined,canonicalUrl},jsonLd:parseJsonLd($),alternateUrl,title};
 }
 
-function isGenericGoogleTitle(value?: string) {
-  const text = value?.trim().toLowerCase();
-  return !text || text === "google maps" || text === "google" || text.startsWith("google maps -");
-}
+function collectPlaceRecords(value:unknown,output:unknown[][]=[]):unknown[][]{if(!Array.isArray(value))return output;if(typeof value[11]==="string"&&Array.isArray(value[2])&&(typeof value[39]==="string"||typeof value[18]==="string"))output.push(value);for(const child of value)if(Array.isArray(child))collectPlaceRecords(child,output);return output;}
+function externalWebsite(value:unknown){if(!Array.isArray(value)||typeof value[0]!=="string")return undefined;try{const raw=value[0] as string;if(raw.startsWith("/url?"))return new URL(raw,"https://www.google.com").searchParams.get("q")||undefined;return /^https?:\/\//i.test(raw)?raw:undefined;}catch{return undefined;}}
+function parsePlaceRecord(r:unknown[]):ParsedFields{const partsArray=Array.isArray(r[2])?r[2].filter((v):v is string=>typeof v==="string"):[];const address=typeof r[39]==="string"?r[39]:partsArray.join(", ");const p=parseAddressParts(address);const coordinates=Array.isArray(r[9])&&typeof r[9][2]==="number"&&typeof r[9][3]==="number"?{latitude:r[9][2],longitude:r[9][3]}:undefined;const categories=Array.isArray(r[13])?r[13].filter((v):v is string=>typeof v==="string"):[];const phone=Array.isArray(r[178])&&Array.isArray(r[178][0])&&typeof r[178][0][0]==="string"?r[178][0][0]:undefined;return{name:r[11] as string,address,city:p.city,state:p.state,zip:p.zip,phone,website:externalWebsite(r[7]),category:categories[0],coordinates,placeId:typeof r[78]==="string"?r[78]:typeof r[10]==="string"?r[10]:undefined,canonicalUrl:typeof r[42]==="string"?r[42]:undefined};}
 
-function isGenericGoogleDescription(value?: string) {
-  const text = value?.trim().toLowerCase() || "";
-  return text.includes("find local businesses") && text.includes("driving directions");
-}
+export function parseEmbeddedMapsPayload(text:string,nameHint?:string,placeIdHint?:string,locationHint:Pick<ParsedFields,"city"|"state"|"zip">={}):ParsedFields|undefined{let data:unknown;try{data=JSON.parse(text.replace(/^\)\]\}'\s*/,"").trim());}catch{return undefined;}const records=collectPlaceRecords(data);if(!records.length)return undefined;const expectedState=locationHint.state||stateHint(nameHint);const ranked=records.map((r)=>{const parsed=parsePlaceRecord(r);const exact=Boolean(placeIdHint&&parsed.placeId&&normalizeText(parsed.placeId)===normalizeText(placeIdHint));const wrongLocation=Boolean((expectedState&&parsed.state&&expectedState!==parsed.state)||(locationHint.zip&&parsed.zip&&locationHint.zip!==parsed.zip)||(locationHint.city&&parsed.city&&normalizeText(locationHint.city)!==normalizeText(parsed.city)));return{parsed,score:exact?2:wrongLocation?0:nameSimilarity(parsed.name||"",nameHint||"")};}).sort((a,b)=>b.score-a.score);return ranked[0].score<.6?undefined:ranked[0].parsed;}
+function hasEmbeddedPlaceRecords(text:string){try{return collectPlaceRecords(JSON.parse(text.replace(/^\)\]\}'\s*/,"").trim())).length>0;}catch{return false;}}
 
-export async function resolveGoogleMapsBusiness(inputUrl: string): Promise<Business> {
-  const parsed = new URL(inputUrl);
-  const host = parsed.hostname.toLowerCase();
-  if (!host.includes("google.") && host !== "maps.app.goo.gl" && host !== "goo.gl") {
-    throw new Error("Please paste a Google Maps company link.");
-  }
+function isGenericGoogleTitle(value?:string){const t=value?.trim().toLowerCase();return!t||t==="google maps"||t==="google"||t==="карти google"||t.startsWith("google maps -");}
+export function classifyMapsResponse(input:{httpStatus:number;html:string;title?:string;hasBusinessData:boolean}):{status:MapsStatus;reason:string}{if(input.httpStatus===429||input.httpStatus===403)return{status:"blocked",reason:`Google Maps returned HTTP ${input.httpStatus}.`};if(input.httpStatus<200||input.httpStatus>=300)return{status:"error",reason:`Google Maps returned HTTP ${input.httpStatus}.`};if(isGenericGoogleTitle(input.title)&&!input.hasBusinessData)return{status:"shell_only",reason:"Google Maps returned only its generic shell and no strategy extracted business metadata."};if(input.hasBusinessData)return{status:"resolved",reason:"Google Maps exposed business metadata."};return{status:"partial",reason:"Google Maps responded, but only partial business metadata was available."};}
 
-  let finalUrl = inputUrl;
-  let html = "";
-  let mapsFetchWarning: string | undefined;
+function chooseFields(candidates:FieldCandidates){const fields:Business["mapsFieldEvidence"]={};for(const [field,values] of Object.entries(candidates) as [MapsFieldName,MapsFieldEvidence[]][]){const grouped=new Map<string,MapsFieldEvidence[]>();for(const value of values){const key=field==="phone"?value.value.replace(/\D/g,""):normalizeText(value.value);const group=grouped.get(key)||[];group.push(value);grouped.set(key,group);}const ranked=[...grouped.values()].map(group=>({group,score:Math.max(...group.map(i=>i.confidence))+Math.min(10,(group.length-1)*5)})).sort((a,b)=>b.score-a.score);if(!ranked[0])continue;const best=[...ranked[0].group].sort((a,b)=>b.confidence-a.confidence)[0];fields[field]={...best,confidence:Math.min(100,ranked[0].score)};}return fields;}
+function debugEntry(strategy:MapsStrategyDebug["strategy"],started:number,fields:ParsedFields,reason?:string):MapsStrategyDebug{const fieldsFound=FIELD_NAMES.filter(field=>Boolean(fields[field]));return{strategy,status:fieldsFound.length?(fieldsFound.length>=3?"resolved":"partial"):"empty",fieldsFound,durationMs:Math.round(performance.now()-started),reason};}
 
-  try {
-    const response = await fetch(inputUrl, {
-      redirect: "follow",
-      cache: "no-store",
-      headers: {
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
-        "accept-language": "en-US,en;q=0.9",
-      },
-    });
+export function mergeMapsWithSeed(resolved:Business,seed?:Partial<Pick<Business,MapsFieldName>>):Business{if(!seed)return resolved;const evidence={...(resolved.mapsFieldEvidence||{})};const merged={...resolved,mapsFieldEvidence:evidence};for(const field of FIELD_NAMES){const value=clean(seed[field]);if(!value)continue;const mapsEvidence=evidence[field];if(!mapsEvidence||mapsEvidence.confidence<70){(merged as Record<string,unknown>)[field]=value;evidence[field]={value,source:"seed",confidence:95,evidence:"Exact field supplied by seed/CSV fallback."};}}return merged;}
 
-    if (!response.ok) {
-      mapsFetchWarning = `Google Maps returned HTTP ${response.status}; continuing with data available in the URL/CSV.`;
-    } else {
-      finalUrl = response.url || inputUrl;
-      html = await response.text();
-    }
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : "request failed";
-    mapsFetchWarning = `Google Maps fetch failed (${reason}); continuing with data available in the URL/CSV.`;
-  }
-
-  const urlName = nameFromMapsUrl(finalUrl) || nameFromMapsUrl(inputUrl);
-
-  if (!html) {
-    return { name: urlName, mapsUrl: finalUrl, mapsFetchWarning };
-  }
-
-  const $ = cheerio.load(html);
-  const title = clean($("meta[property='og:title']").attr("content") || $("title").text());
-  const description = clean($("meta[property='og:description']").attr("content") || "") || "";
-  const text = `${html}\n${description}`;
-
-  const parsedTitle = title?.replace(/\s*-\s*Google Maps.*$/i, "").replace(/\s*·\s*Google.*$/i, "");
-  const name = isGenericGoogleTitle(title) || isGenericGoogleTitle(parsedTitle) ? urlName : (parsedTitle || urlName);
-
-  const phone = firstMatch(text, [
-    /\"formatted_phone_number\"\s*:\s*\"([^\"]+)\"/i,
-    /\"telephone\"\s*:\s*\"([^\"]+)\"/i,
-    /\[(?:null,)?\"(\+?\d[\d\s().-]{7,}\d)\"\s*,\s*\"tel:/i,
-  ]);
-
-  const address = firstMatch(text, [
-    /\"streetAddress\"\s*:\s*\"([^\"]+)\"/i,
-    /\"address\"\s*:\s*\{[^}]*\"streetAddress\"\s*:\s*\"([^\"]+)\"/i,
-    /\"formatted_address\"\s*:\s*\"([^\"]+)\"/i,
-  ]) || (!isGenericGoogleDescription(description) ? clean(description.split("·")[0]) : undefined);
-
-  const website = firstMatch(text, [
-    /\"url\"\s*:\s*\"(https?:\\?\/\\?\/[^\"]+)\"\s*,\s*\"sameAs\"/i,
-    /\"website\"\s*:\s*\"(https?:\\?\/\\?\/[^\"]+)\"/i,
-  ]);
-
-  const category = firstMatch(text, [
-    /\"@type\"\s*:\s*\"([^\"]+)\"/i,
-    /\"category\"\s*:\s*\"([^\"]+)\"/i,
-  ]);
-
-  if (isGenericGoogleTitle(title)) {
-    mapsFetchWarning = mapsFetchWarning || "Google Maps returned only its generic shell page; using the company name from the Maps URL.";
-  }
-
-  return { name, address, phone, website, category, mapsUrl: finalUrl, mapsFetchWarning };
+export async function resolveGoogleMapsBusiness(inputUrl:string,options:{fetcher?:FetchLike;timeoutMs?:number}={}):Promise<Business>{
+  const parsedInput=new URL(inputUrl),host=parsedInput.hostname.toLowerCase();if(!/(^|\.)google\.[a-z.]+$/.test(host)&&host!=="maps.app.goo.gl"&&host!=="goo.gl")throw new Error("Please paste a Google Maps company link.");
+  const fetcher=options.fetcher||fetch,timeoutMs=options.timeoutMs||5500,strategies:MapsStrategyDebug[]=[],candidates:FieldCandidates={};let finalUrl=inputUrl,html="",httpStatus:number|undefined,fetchFailure:MapsStatus|undefined,fetchReason:string|undefined;
+  let started=performance.now();const inputFields=parseMapsUrl(inputUrl);const inputConfidence=parsedInput.pathname.includes("/maps/preview/place/")?78:parsedInput.pathname.includes("/place/")?60:35;addParsed(candidates,inputFields,"url",inputConfidence,"Decoded from the input Maps URL.");strategies.push(debugEntry("url",started,inputFields));
+  try{const response=await fetcher(inputUrl,{redirect:"follow",cache:"no-store",signal:AbortSignal.timeout(timeoutMs),headers:{"user-agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36","accept-language":"en-US,en;q=0.9"}});httpStatus=response.status;finalUrl=response.url||inputUrl;if(!response.ok){fetchFailure=response.status===403||response.status===429?"blocked":"error";fetchReason=`Google Maps returned HTTP ${response.status}.`;}else html=await response.text();}catch(error){fetchFailure=error instanceof Error&&(error.name==="TimeoutError"||error.name==="AbortError")?"timeout":"error";fetchReason=fetchFailure==="timeout"?`Google Maps request timed out after ${timeoutMs} ms.`:`Google Maps fetch failed: ${error instanceof Error?error.message:"request failed"}`;}
+  started=performance.now();const redirectFields=finalUrl!==inputUrl?parseMapsUrl(finalUrl):{};addParsed(candidates,redirectFields,"redirect_url",65,"Decoded from the final URL after redirects.");const redirectDebug=debugEntry("redirect_url",started,redirectFields,finalUrl===inputUrl?"No redirect occurred.":undefined);strategies.push({...redirectDebug,status:finalUrl===inputUrl?"skipped":redirectDebug.status});
+  let metadata:ReturnType<typeof parseHtmlMetadata>|undefined;if(html){started=performance.now();metadata=parseHtmlMetadata(html);addParsed(candidates,metadata.meta,"meta",72,"Extracted from HTML title, description, or canonical tags.");strategies.push(debugEntry("html_metadata",started,metadata.meta));started=performance.now();const jsonFields=metadata.jsonLd.reduce<ParsedFields>((result,item)=>({...result,...Object.fromEntries(Object.entries(item).filter(([,v])=>v))}),{});addParsed(candidates,jsonFields,"json_ld",88,"Extracted from JSON-LD structured data.");strategies.push(debugEntry("json_ld",started,jsonFields));}else{strategies.push({strategy:"html_metadata",status:"skipped",fieldsFound:[],durationMs:0,reason:fetchReason||"No HTML response."},{strategy:"json_ld",status:"skipped",fieldsFound:[],durationMs:0,reason:fetchReason||"No HTML response."});}
+  let payloadFields:ParsedFields|undefined;let alternateUrl=metadata?.alternateUrl;started=performance.now();
+  if(!alternateUrl&&html&&(inputFields.name||redirectFields.name)){try{const hint=inputFields.name||redirectFields.name!;const probe=new URL("https://www.google.com/maps/search/");probe.searchParams.set("api","1");probe.searchParams.set("query",hint!);const identity=redirectFields.placeId||inputFields.placeId;if(identity?.startsWith("ChIJ"))probe.searchParams.set("query_place_id",identity);const response=await fetcher(probe,{cache:"no-store",signal:AbortSignal.timeout(Math.min(timeoutMs,3000)),headers:{"user-agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36","accept-language":"en-US,en;q=0.9"}});if(response.ok)alternateUrl=parseHtmlMetadata(await response.text()).alternateUrl;}catch{}}
+  if(alternateUrl){try{const alternate=new URL(alternateUrl);alternate.searchParams.set("hl","en");alternate.searchParams.set("gl","us");const response=await fetcher(alternate,{cache:"no-store",signal:AbortSignal.timeout(Math.min(timeoutMs,3000)),headers:{"user-agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36","accept-language":"en-US,en;q=0.9"}});if(!response.ok)strategies.push({strategy:"embedded_payload",status:response.status===403||response.status===429?"blocked":"error",fieldsFound:[],durationMs:Math.round(performance.now()-started),reason:`Alternate Maps payload returned HTTP ${response.status}.`});else{const payloadText=await response.text();const locationHint={city:inputFields.city||redirectFields.city,state:inputFields.state||redirectFields.state,zip:inputFields.zip||redirectFields.zip};payloadFields=parseEmbeddedMapsPayload(payloadText,inputFields.name||redirectFields.name||metadata?.meta.name,redirectFields.placeId||inputFields.placeId,locationHint);if(payloadFields){addParsed(candidates,payloadFields,"embedded_payload",94,"Extracted from Google's structured Maps result payload.");strategies.push(debugEntry("embedded_payload",started,payloadFields));}else strategies.push({strategy:"embedded_payload",status:"empty",fieldsFound:[],durationMs:Math.round(performance.now()-started),reason:hasEmbeddedPlaceRecords(payloadText)?"maps_candidate_identity_mismatch":"No matching business record was found in the alternate payload."});}}catch(error){const timeout=error instanceof Error&&(error.name==="TimeoutError"||error.name==="AbortError");strategies.push({strategy:"embedded_payload",status:timeout?"timeout":"error",fieldsFound:[],durationMs:Math.round(performance.now()-started),reason:timeout?"Alternate Maps payload timed out.":error instanceof Error?error.message:"Payload request failed."});}}else strategies.push({strategy:"embedded_payload",status:"skipped",fieldsFound:[],durationMs:Math.round(performance.now()-started),reason:html?"No alternate Maps payload URL was available after the bounded probe.":"No HTML response."});
+  const evidence=chooseFields(candidates);const reliable=Object.entries(evidence).filter(([field,item])=>field!=="name"?(item?.confidence||0)>=65:(item?.confidence||0)>=70);let mapsStatus:MapsStatus,mapsStatusReason:string;if(fetchFailure&&!reliable.length){mapsStatus=fetchFailure;mapsStatusReason=fetchReason||"Maps request failed.";}else if(!reliable.length){mapsStatus="shell_only";mapsStatusReason="Google Maps returned HTTP successfully, but no strategy extracted reliable business metadata.";}else if(evidence.name&&evidence.address){mapsStatus="resolved";mapsStatusReason="Google Maps business identity and address were resolved.";}else{mapsStatus="partial";mapsStatusReason="Google Maps exposed only partial business metadata.";}
+  const addressParts=parseAddressParts(evidence.address?.value);for(const field of ["city","state","zip"] as const)if(addressParts[field]&&!evidence[field])evidence[field]={value:addressParts[field]!,source:evidence.address!.source,confidence:evidence.address!.confidence,evidence:"Parsed from resolved Maps address."};const warning=fetchFailure?`${fetchReason} Continuing with URL/seed data.`:mapsStatus==="shell_only"?mapsStatusReason:undefined;
+  return{name:evidence.name?.value,address:evidence.address?.value,city:evidence.city?.value,state:evidence.state?.value,zip:evidence.zip?.value,phone:evidence.phone?.value,website:evidence.website?.value,category:evidence.category?.value,mapsUrl:payloadFields?.canonicalUrl||metadata?.meta.canonicalUrl||finalUrl,mapsInputUrl:inputUrl,mapsFetchWarning:warning,mapsStatus,mapsHttpStatus:httpStatus,mapsStatusReason,mapsStrategies:strategies,mapsFieldEvidence:evidence,coordinates:payloadFields?.coordinates||redirectFields.coordinates||inputFields.coordinates,placeId:payloadFields?.placeId||redirectFields.placeId||inputFields.placeId,mapsAddressParseError:evidence.address&&!evidence.state?(addressParts.error||"A Maps address was found, but state detection failed."):undefined};
 }

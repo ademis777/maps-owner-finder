@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { resolveGoogleMapsBusiness } from "@/lib/maps";
+import { mergeMapsWithSeed, resolveGoogleMapsBusiness } from "@/lib/maps";
 import { findOwnerCandidatesWithDebug } from "@/lib/owners";
 
 const Input = z.object({
@@ -14,33 +14,25 @@ const Input = z.object({
   }).optional(),
 });
 
-function prefer(value?: string, fallback?: string) {
-  const clean = value?.trim();
-  return clean || fallback?.trim() || undefined;
-}
-
 export async function POST(request: Request) {
   try {
+    const totalStarted = performance.now();
     const input = Input.parse(await request.json());
+    const mapsStarted = performance.now();
     const resolved = await resolveGoogleMapsBusiness(input.url);
-    const business = {
-      ...resolved,
-      name: prefer(resolved.name, input.seed?.name),
-      address: prefer(resolved.address, input.seed?.address),
-      phone: prefer(resolved.phone, input.seed?.phone),
-      website: prefer(resolved.website, input.seed?.website),
-      category: prefer(resolved.category, input.seed?.category),
-    };
+    const mapsDurationMs = Math.round(performance.now() - mapsStarted);
+    const business = mergeMapsWithSeed(resolved, input.seed);
 
-    const { ownerCandidates, debug, businessContacts } = await findOwnerCandidatesWithDebug(business);
-    if (!business.phone && businessContacts.phones.length) business.phone = businessContacts.phones[0];
+    const { ownerCandidates, debug } = await findOwnerCandidatesWithDebug(business);
+    debug.timing.unshift({ stage: "maps_fetch", status: "completed", durationMs: mapsDurationMs });
+    debug.timing.push({ stage: "api_total", status: "completed", durationMs: Math.round(performance.now() - totalStarted) });
 
     const warnings: string[] = [];
     if (resolved.mapsFetchWarning) warnings.push(resolved.mapsFetchWarning);
     if (!resolved.phone && input.seed?.phone) warnings.push("Phone came from the uploaded CSV because Google Maps did not expose it in public HTML.");
-    if (!resolved.phone && !input.seed?.phone && business.phone) warnings.push("Phone came from a matching external public business source because Google Maps did not expose it.");
     if (!resolved.website && input.seed?.website) warnings.push("Website came from the uploaded CSV because Google Maps did not expose it in public HTML.");
     if (!resolved.address && input.seed?.address) warnings.push("Address came from the uploaded CSV because Google Maps did not expose it in public HTML.");
+    if (business.mapsAddressParseError) warnings.push(business.mapsAddressParseError);
     if (ownerCandidates.length === 0) warnings.push("No owner candidate was strong enough to return from the public search results checked.");
 
     return NextResponse.json({ business, ownerCandidates, warnings, debug });
