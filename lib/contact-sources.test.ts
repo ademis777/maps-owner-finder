@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { searchFmcsaContact, searchNycDcwpApplications, searchNycDobLicense } from "./contact-sources.ts";
+import { parseStructuredPublicDocumentContact, reconcilePublicDocumentPerson, searchFmcsaContact, searchNycDcwpApplications, searchNycDobLicense, searchPublicDocumentContact } from "./contact-sources.ts";
 import { classifyOwnerContact } from "./owners.ts";
 
 const business = { name: "Smith Roofing LLC", address: "10 Main St, Brooklyn, NY 11210", phone: "718-555-0100", mapsUrl: "x", mapsStatus: "shell_only" as const };
@@ -112,4 +112,45 @@ test("absence of an indexed FMCSA relationship returns empty", async () => {
   const result = await searchFmcsaContact("Doreth McKenzie", dMack, { search: async () => [] });
   assert.equal(result.status, "empty");
   assert.equal(result.candidatesFound.length, 0);
+});
+
+const jets = { name: "Jets Towing Inc", address: "918 E 51st St, Brooklyn, NY 11203", city: "Brooklyn", state: "NY", category: "Towing service", phone: "718-251-7200", mapsUrl: "x", mapsStatus: "resolved" as const };
+const mtaUrl = "https://www.mta.info/document/130376";
+const mtaRow = "Vendor | Contact Name | Email ID | Telephone\nJets Towing Inc. | Charles Gampero Jr | jetstowing1967@gmail.com | 718/251-7200";
+
+test("exact/reconciled named vendor row yields email while business phone stays business", async () => {
+  const parsed = parseStructuredPublicDocumentContact(mtaRow, "Charle S L Gampero", jets, mtaUrl);
+  assert.equal(parsed.candidates.length, 2);
+  const email = parsed.candidates.find((item) => item.kind === "email")!;
+  const phone = parsed.candidates.find((item) => item.kind === "phone")!;
+  assert.match(parsed.reconciliation!, /Charle\/Charles/i);
+  assert.equal(classifyOwnerContact({ value: email.value, kind: email.kind, sourceUrl: email.sourceUrl, evidenceText: email.evidenceText, ownerName: email.personName, businessName: email.companyName, businessPhones: [jets.phone], sourceName: email.sourceName }).contactType, "verified_direct");
+  assert.equal(classifyOwnerContact({ value: phone.value, kind: phone.kind, sourceUrl: phone.sourceUrl, evidenceText: phone.evidenceText, ownerName: phone.personName, businessName: phone.companyName, businessPhones: [jets.phone], sourceName: phone.sourceName }).contactType, "business");
+});
+
+test("Jr suffix and middle initials do not block cautious same-company person reconciliation", () => {
+  assert.equal(reconcilePublicDocumentPerson("Charles S L Gampero", "Charles Gampero Jr.", true).matched, true);
+  assert.equal(reconcilePublicDocumentPerson("Charle S L Gampero", "Charles Gampero Jr.", false).matched, false);
+});
+
+test("general email in a named vendor row remains general", () => {
+  const parsed = parseStructuredPublicDocumentContact(mtaRow.replace("jetstowing1967@gmail.com", "info@jetstowing.com"), "Charle S L Gampero", jets, mtaUrl);
+  const raw = parsed.candidates.find((item) => item.kind === "email")!;
+  assert.equal(classifyOwnerContact({ value: raw.value, kind: raw.kind, sourceUrl: raw.sourceUrl, evidenceText: raw.evidenceText, ownerName: raw.personName, businessName: raw.companyName }).contactType, "general_email");
+});
+
+test("wrong company, wrong person, and unstructured document are rejected", () => {
+  assert.equal(parseStructuredPublicDocumentContact(mtaRow.replace("Jets Towing Inc.", "Other Towing LLC"), "Charle S L Gampero", jets, mtaUrl).candidates.length, 0);
+  assert.equal(parseStructuredPublicDocumentContact(mtaRow.replace("Charles Gampero Jr", "John Smith"), "Charle S L Gampero", jets, mtaUrl).candidates.length, 0);
+  assert.equal(parseStructuredPublicDocumentContact("Jets Towing Inc. won a public contract. Charles Gampero Jr attended.", "Charle S L Gampero", jets, mtaUrl).candidates.length, 0);
+});
+
+test("public-document discovery accepts an official structured result without hardcoded URL", async () => {
+  const source = await searchPublicDocumentContact("Charle S L Gampero", jets, {
+    search: async () => ({ status: "ok", hits: [{ title: "SSE# 0000457639", url: mtaUrl, snippet: mtaRow }] }),
+    fetchDocument: async () => ({ status: "blocked", reason: "HTTP 403" }),
+  });
+  assert.equal(source.status, "matched");
+  assert.equal(source.candidatesFound.find((item) => item.kind === "email")?.value, "jetstowing1967@gmail.com");
+  assert.equal(source.documentsAccepted?.[0], mtaUrl);
 });

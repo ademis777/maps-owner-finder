@@ -2,7 +2,7 @@ import * as cheerio from "cheerio";
 import type { Business } from "./maps";
 import { classifyRole, type RelationshipType, type SourceDebug } from "./owner-sources.ts";
 import { detectState, searchStateRegistries } from "./state-registry.ts";
-import { searchFmcsaContact, searchProfessionalContactSources, shouldRunFmcsaContact, type ContactSourceDebug } from "./contact-sources.ts";
+import { searchFmcsaContact, searchProfessionalContactSources, searchPublicDocumentContact, shouldRunFmcsaContact, type ContactSourceDebug } from "./contact-sources.ts";
 
 type OwnerEvidenceSource = { label: string; url: string; snippet?: string; phones?: string[]; emails?: string[]; sourceName?: string; evidenceText?: string; companyMatchEvidence?: string; relationshipType?: RelationshipType };
 
@@ -182,12 +182,13 @@ export function classifyOwnerContact(input: {
   }
 
   const explicit = hasExplicitPersonalEvidence(evidenceText, ownerName, value);
+  const structuredNamedEmail = kind === "email" && /official procurement\/vendor structured row:[^]+contact name\s*=[^|]+\|\s*email(?: id)?\s*=/i.test(evidenceText);
   const sameBusinessPhone = kind === "phone" && (input.businessPhones || []).some((phone) => normalizePhone(phone) === normalizePhone(value));
   if (sameBusinessPhone && !explicit) {
     return { ...common, contactType: "business", confidence: 98, reason: "Phone matches a known Google Maps/CSV business phone and lacks explicit personal evidence." };
   }
-  if (explicit) {
-    return { ...common, contactType: "verified_direct", confidence: 94, reason: "Source explicitly links the contact to the person as direct, mobile, cell, personal, or a personal profile contact." };
+  if (explicit || structuredNamedEmail) {
+    return { ...common, contactType: "verified_direct", confidence: structuredNamedEmail ? 92 : 94, reason: structuredNamedEmail ? "Official structured procurement/vendor row explicitly assigns this email field to the named confirmed contact." : "Source explicitly links the contact to the person as direct, mobile, cell, personal, or a personal profile contact." };
   }
 
   const normalizedEvidence = normalize(evidenceText);
@@ -577,7 +578,11 @@ export async function findOwnerCandidatesWithDebug(business: Business): Promise<
   const completedContactTasks: Array<{ candidate: OwnerCandidate; contacts: OwnerContact[]; debugEntry?: OwnerDebug["contactEnrichment"][number] }> = [];
   const contactTasks: Promise<void>[] = [];
   const fmcsaTasks: Promise<void>[] = [];
+  const publicDocumentTasks: Promise<void>[] = [];
+  let publicDocumentChain = Promise.resolve();
+  let publicDocumentStrongMatch = false;
   const fmcsaCompleted = new Set<string>();
+  const publicDocumentCompleted = new Set<string>();
   for (const candidate of ranked) {
     const knownBusinessPhones = uniq([...(business.phone ? [business.phone] : []), ...businessContacts.phones]);
     for (const source of candidate.sources.slice(0, 3)) candidate.contacts.push(...extractOwnerContactEvidence(`${source.label}. ${source.snippet || ""}`, candidate.name, business.name!, source.url, knownBusinessPhones));
@@ -607,6 +612,26 @@ export async function findOwnerCandidatesWithDebug(business: Business): Promise<
         completedContactTasks.push({ candidate, contacts: [], debugEntry: { personName: candidate.name, companyName: business.name!, sources: [source] } });
       }));
     }
+    const publicDocumentStarted = performance.now();
+    const publicDocumentTask = publicDocumentChain.then(() => publicDocumentStrongMatch
+      ? ({ sourceName: "PUBLIC DOCUMENT CONTACT ENRICHMENT", attempted: false, input: `${candidate.name} | ${business.name || ""} | ${business.address || ""}`, status: "skipped", candidatesFound: [], acceptedCandidates: [], rejectedCandidates: [], reason: "Skipped after an earlier confirmed owner produced a strong structured public-document contact match." } as ContactSourceDebug)
+      : searchPublicDocumentContact(candidate.name, business)).then((source) => {
+      source.durationMs = Math.round(performance.now() - publicDocumentStarted);
+      const contacts: OwnerContact[] = [];
+      for (const raw of source.candidatesFound) {
+        const contact = classifyOwnerContact({ value: raw.value, kind: raw.kind, sourceUrl: raw.sourceUrl, evidenceText: raw.evidenceText, ownerName: candidate.name, businessName: business.name!, businessPhones: uniq([...knownBusinessPhones, ...(raw.relatedBusinessPhones || [])]), sourceName: raw.sourceName });
+        contacts.push(contact); source.acceptedCandidates.push({ ...raw, contactType: contact.contactType, confidence: contact.confidence, reason: contact.reason }); source.classificationReason = contact.reason;
+      }
+      if (source.status === "matched" && contacts.some((contact) => contact.contactType === "verified_direct" || contact.contactType === "possible_direct")) publicDocumentStrongMatch = true;
+      publicDocumentCompleted.add(ownerPersonKey(candidate.name));
+      completedContactTasks.push({ candidate, contacts, debugEntry: { personName: candidate.name, companyName: business.name!, sources: [source] } });
+    }).catch((error) => {
+      const source: ContactSourceDebug = { sourceName: "PUBLIC DOCUMENT CONTACT ENRICHMENT", attempted: true, input: `${candidate.name} | ${business.name || ""} | ${business.address || ""}`, status: "error", candidatesFound: [], acceptedCandidates: [], rejectedCandidates: [], durationMs: Math.round(performance.now() - publicDocumentStarted), reason: error instanceof Error ? error.message : "Public-document enrichment failed" };
+      publicDocumentCompleted.add(ownerPersonKey(candidate.name));
+      completedContactTasks.push({ candidate, contacts: [], debugEntry: { personName: candidate.name, companyName: business.name!, sources: [source] } });
+    });
+    publicDocumentChain = publicDocumentTask.catch(() => undefined);
+    publicDocumentTasks.push(publicDocumentTask);
     const directQueries = [
       `"${candidate.name}" "${business.name}" phone`,
       `"${candidate.name}" "${business.name}" email`,
@@ -629,9 +654,14 @@ export async function findOwnerCandidatesWithDebug(business: Business): Promise<
   }
   const contactBudgetMs = 2500;
   const fmcsaBudgetMs = 30000;
-  const [contactBudget, fmcsaBudget] = await Promise.all([withTimeBudget(Promise.all(contactTasks), contactBudgetMs), withTimeBudget(Promise.all(fmcsaTasks), fmcsaBudgetMs)]);
+  const publicDocumentBudgetMs = 15000;
+  const [contactBudget, fmcsaBudget, publicDocumentBudget] = await Promise.all([withTimeBudget(Promise.all(contactTasks), contactBudgetMs), withTimeBudget(Promise.all(fmcsaTasks), fmcsaBudgetMs), withTimeBudget(Promise.all(publicDocumentTasks), publicDocumentBudgetMs)]);
   if (fmcsaBudget.status === "timeout") for (const candidate of ranked) if (shouldRunFmcsaContact(business) && !fmcsaCompleted.has(ownerPersonKey(candidate.name))) {
     const source: ContactSourceDebug = { sourceName: "FMCSA CONTACT ENRICHMENT", attempted: true, input: `${candidate.name} | ${business.name || ""} | ${business.address || ""}`, status: "timeout", candidatesFound: [], acceptedCandidates: [], rejectedCandidates: [], durationMs: fmcsaBudgetMs, reason: `FMCSA enrichment did not complete within its dedicated ${fmcsaBudgetMs}ms budget; owner result preserved.` };
+    completedContactTasks.push({ candidate, contacts: [], debugEntry: { personName: candidate.name, companyName: business.name!, sources: [source] } });
+  }
+  if (publicDocumentBudget.status === "timeout") for (const candidate of ranked) if (!publicDocumentCompleted.has(ownerPersonKey(candidate.name))) {
+    const source: ContactSourceDebug = { sourceName: "PUBLIC DOCUMENT CONTACT ENRICHMENT", attempted: true, input: `${candidate.name} | ${business.name || ""} | ${business.address || ""}`, status: "timeout", candidatesFound: [], acceptedCandidates: [], rejectedCandidates: [], durationMs: publicDocumentBudgetMs, reason: `Public-document enrichment did not complete within its dedicated ${publicDocumentBudgetMs}ms budget; owner result preserved.` };
     completedContactTasks.push({ candidate, contacts: [], debugEntry: { personName: candidate.name, companyName: business.name!, sources: [source] } });
   }
   for (const result of completedContactTasks) { result.candidate.contacts.push(...result.contacts); if (result.debugEntry) debug.contactEnrichment.push(result.debugEntry); }
@@ -647,6 +677,7 @@ export async function findOwnerCandidatesWithDebug(business: Business): Promise<
   const contactStatus = contactBudget.status === "completed" ? "completed" : completedContactTasks.length ? "partial" : "timeout";
   debug.timing.push({ stage: "contact_enrichment", status: contactStatus, durationMs: Math.round(performance.now() - contactStarted), reason: contactBudget.status === "timeout" ? `overall contact enrichment budget of ${contactBudgetMs}ms reached; owner result preserved` : undefined });
   if (fmcsaTasks.length) debug.timing.push({ stage: "fmcsa_contact_enrichment", status: fmcsaBudget.status === "completed" ? "completed" : "timeout", durationMs: Math.min(fmcsaBudgetMs, Math.round(performance.now() - contactStarted)), reason: fmcsaBudget.status === "timeout" ? `dedicated FMCSA budget of ${fmcsaBudgetMs}ms reached; owner result preserved` : undefined });
+  debug.timing.push({ stage: "public_document_contact_enrichment", status: publicDocumentBudget.status === "completed" ? "completed" : "timeout", durationMs: Math.min(publicDocumentBudgetMs, Math.round(performance.now() - contactStarted)), reason: publicDocumentBudget.status === "timeout" ? `dedicated public-document budget of ${publicDocumentBudgetMs}ms reached; owner result preserved` : undefined });
   debug.timing.push({ stage: "owners_total", status: "completed", durationMs: Math.round(performance.now() - totalStarted) });
 
   return { ownerCandidates: ranked, debug, businessContacts };

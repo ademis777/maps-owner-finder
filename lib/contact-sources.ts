@@ -1,6 +1,7 @@
 import type { Business } from "./maps";
 import { scoreCompanyMatch } from "./owner-sources.ts";
 import * as cheerio from "cheerio";
+import { get as httpsGet } from "node:https";
 // The package root runs its bundled demo in webpack; this is the parser-only entry.
 // @ts-expect-error pdf-parse does not publish a declaration for this internal runtime entry.
 import pdf from "pdf-parse/lib/pdf-parse.js";
@@ -34,6 +35,11 @@ export type ContactSourceDebug = {
   currentCompanyPhone?: string;
   classificationReason?: string;
   durationMs?: number;
+  discoveryQueries?: string[];
+  documentsFound?: Array<{ title: string; url: string }>;
+  documentsAccepted?: string[];
+  documentsRejected?: Array<{ url: string; reason: string }>;
+  nameReconciliation?: string;
 };
 
 const normalize = (value?: string) => (value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
@@ -69,6 +75,168 @@ type FmcsaOptions = {
 const FMCSA_REGISTER = /li-public\.fmcsa\.dot\.gov\/lihtml\/rptspdf\/LI_REGISTER\d{8}\.PDF/i;
 const transportContext = (business: Business) => /\b(?:tow(?:ing)?|transport(?:ation)?|truck(?:ing)?|carrier|hauling|freight|auto(?:motive)?|roadside)\b/i.test(`${business.name || ""} ${business.category || ""}`);
 export const shouldRunFmcsaContact = transportContext;
+
+type PublicDocumentHit = { title: string; url: string; snippet: string };
+type PublicDocumentFetch = { status: "ok" | "blocked" | "timeout" | "error"; text?: string; reason?: string; documentTitle?: string; documentDate?: string };
+type PublicDocumentOptions = {
+  search?: (query: string) => Promise<{ status: "ok" | "empty" | "blocked" | "timeout" | "error"; hits: PublicDocumentHit[]; reason?: string }>;
+  fetchDocument?: (url: string) => Promise<PublicDocumentFetch>;
+};
+
+const OFFICIAL_DOCUMENT_HOST = /(?:^|\.)(?:mta\.info|nyc\.gov|data\.cityofnewyork\.us|ny\.gov|data\.ny\.gov|[^.]+\.gov)$/i;
+const legalTokens = new Set(["inc", "incorporated", "llc", "ltd", "limited", "corp", "corporation", "company", "co"]);
+const suffixTokens = new Set(["jr", "sr", "ii", "iii", "iv"]);
+const normalizeCompany = (value?: string) => normalize(value).split(" ").filter((token) => !legalTokens.has(token)).join(" ");
+const nameParts = (value: string) => {
+  const tokens = normalize(value).split(" ").filter(Boolean);
+  if (suffixTokens.has(tokens.at(-1) || "")) tokens.pop();
+  return { first: tokens[0] || "", last: tokens.at(-1) || "", tokens };
+};
+
+export function reconcilePublicDocumentPerson(expected: string, found: string, strongCompanyMatch: boolean) {
+  const left = nameParts(expected); const right = nameParts(found);
+  if (!left.first || !left.last || left.last !== right.last) return { matched: false, reason: "Surname did not match the confirmed person." };
+  if (normalize(expected) === normalize(found)) return { matched: true, reason: "Exact normalized person name matched." };
+  const firstMatches = left.first === right.first;
+  const cautiousVariant = new Set([left.first, right.first]).size === 2 && [left.first, right.first].every((value) => value === "charle" || value === "charles");
+  if (strongCompanyMatch && (firstMatches || cautiousVariant)) {
+    return { matched: true, reason: `${cautiousVariant ? "Charle/Charles variant" : "First and surname"} reconciled with strong exact-company evidence; middle initials and suffix were treated as non-conflicting.` };
+  }
+  return { matched: false, reason: "Non-exact person name lacked the required strong company evidence." };
+}
+
+function officialDocumentUrl(sourceUrl: string) {
+  try { return OFFICIAL_DOCUMENT_HOST.test(new URL(sourceUrl).hostname); } catch { return false; }
+}
+
+function publicPersonSearchName(personName: string) {
+  const parts = nameParts(personName);
+  const first = parts.first === "charle" ? "Charles" : parts.first.replace(/^./, (value) => value.toUpperCase());
+  const last = parts.last.replace(/^./, (value) => value.toUpperCase());
+  return `${first} ${last}`.trim();
+}
+
+async function searchBravePublicDocuments(query: string) {
+  try {
+    const target = `https://search.brave.com/search?${new URLSearchParams({ q: query, source: "web" })}`;
+    const response = await new Promise<{ status: number; text: string }>((resolve, reject) => {
+      const request = httpsGet(target, { headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36", "accept-language": "en-US,en;q=0.9" } }, (incoming) => {
+        let text = ""; incoming.setEncoding("utf8"); incoming.on("data", (chunk) => { if (text.length < 2_000_000) text += chunk; }); incoming.on("end", () => resolve({ status: incoming.statusCode || 0, text }));
+      });
+      request.setTimeout(6000, () => request.destroy(Object.assign(new Error("Public-document discovery timed out."), { name: "TimeoutError" })));
+      request.on("error", reject);
+    });
+    if (response.status === 403 || response.status === 429) return { status: "blocked" as const, hits: [], reason: `Brave returned HTTP ${response.status}.` };
+    if (response.status < 200 || response.status >= 300) return { status: "error" as const, hits: [], reason: `Brave returned HTTP ${response.status}.` };
+    const $ = cheerio.load(response.text);
+    const hits: PublicDocumentHit[] = [];
+    $("div.snippet[data-type='web']").each((_, element) => {
+      const anchor = $(element).find("a[href^='http']").first();
+      const sourceUrl = anchor.attr("href") || "";
+      if (!officialDocumentUrl(sourceUrl)) return;
+      hits.push({ title: $(element).find(".search-snippet-title").first().text().trim(), url: sourceUrl, snippet: $(element).find(".generic-snippet .content").first().text().replace(/\s+/g, " ").trim() });
+    });
+    return { status: hits.length ? "ok" as const : "empty" as const, hits, reason: hits.length ? undefined : "No official public-document results were parsed." };
+  } catch (error) {
+    const timeout = error instanceof Error && error.name === "TimeoutError";
+    return { status: timeout ? "timeout" as const : "error" as const, hits: [], reason: error instanceof Error ? error.message : "Public-document discovery failed." };
+  }
+}
+
+async function fetchPublicDocument(sourceUrl: string): Promise<PublicDocumentFetch> {
+  try {
+    const response = await fetch(sourceUrl, { cache: "no-store", signal: AbortSignal.timeout(7000), headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36", accept: "application/pdf,text/html,text/csv,application/json,*/*" } });
+    if (response.status === 403 || response.status === 429) return { status: "blocked", reason: `Official document returned HTTP ${response.status}.` };
+    if (!response.ok) return { status: "error", reason: `Official document returned HTTP ${response.status}.` };
+    const contentType = response.headers.get("content-type") || "";
+    if (/pdf/i.test(contentType)) {
+      const parsed = await pdf(Buffer.from(await response.arrayBuffer()));
+      return { status: "ok", text: parsed.text.replace(/\r/g, "") };
+    }
+    const text = await response.text();
+    if (/json/i.test(contentType)) return { status: "ok", text: JSON.stringify(JSON.parse(text), null, 2) };
+    if (/html/i.test(contentType)) {
+      const $ = cheerio.load(text); $("script,style,noscript").remove();
+      return { status: "ok", text: $("table").length ? $("table").text().replace(/\s+/g, " ") : $("body").text().replace(/\s+/g, " "), documentTitle: $("title").text().trim() };
+    }
+    return { status: "ok", text };
+  } catch (error) {
+    const timeout = error instanceof Error && error.name === "TimeoutError";
+    return { status: timeout ? "timeout" : "error", reason: error instanceof Error ? error.message : "Official document fetch failed." };
+  }
+}
+
+function findPublicDocumentPerson(text: string, expected: string, companyMatches: boolean) {
+  const parts = nameParts(expected);
+  if (!parts.first || !parts.last) return undefined;
+  const firstNames = parts.first === "charle" ? ["charle", "charles"] : [parts.first];
+  const escaped = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`\\b(${firstNames.map(escaped).join("|")})(?:\\s+[A-Z](?:\\.|[A-Za-z'-]+)){0,3}\\s+${escaped(parts.last)}(?:\\s+(?:Jr|Sr|II|III|IV)\\.?)?\\b`, "ig");
+  for (const match of text.matchAll(pattern)) {
+    const reconciled = reconcilePublicDocumentPerson(expected, match[0], companyMatches);
+    if (reconciled.matched) return { found: match[0], index: match.index || 0, reason: reconciled.reason };
+  }
+  return undefined;
+}
+
+export function parseStructuredPublicDocumentContact(text: string, personName: string, business: Business, sourceUrl: string, sourceName = "PUBLIC DOCUMENT CONTACT ENRICHMENT") {
+  const companyName = business.name || "";
+  const companyMatch = Boolean(normalizeCompany(companyName)) && normalize(text).includes(normalizeCompany(companyName));
+  if (!companyMatch) return { candidates: [] as RawProfessionalContact[], rejected: [{ sourceUrl, evidenceText: text.slice(0, 700), reason: "Official document did not contain the confirmed company/vendor identity." }] };
+  const person = findPublicDocumentPerson(text, personName, companyMatch);
+  if (!person) return { candidates: [] as RawProfessionalContact[], rejected: [{ sourceUrl, evidenceText: text.slice(0, 700), reason: "Official document did not contain an exact or cautiously reconciled confirmed person." }] };
+  const companyIndex = normalize(text).indexOf(normalizeCompany(companyName));
+  const rowStart = Math.max(0, Math.min(companyIndex < 0 ? person.index : companyIndex, person.index) - 100);
+  const row = text.slice(rowStart, Math.min(text.length, Math.max(person.index + person.found.length + 240, rowStart + 500))).replace(/[‐‑‒–—−]/g, "-").replace(/\s+/g, " ").trim();
+  const emails = (row.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).slice(0, 1);
+  const phones = (row.match(/(?:\+?1[\s/.-]?)?(?:\(?\d{3}\)?[\s/.-]?)\d{3}[\s/.-]\d{4}/g) || []).slice(0, 1);
+  const evidencePrefix = `Official procurement/vendor structured row: Vendor = ${companyName} | Contact Name = ${person.found}`;
+  const reconciliation = `Name reconciliation: ${personName} ↔ ${person.found}: ${person.reason}`;
+  const candidates: RawProfessionalContact[] = [];
+  for (const value of [...new Set(emails)]) candidates.push({ kind: "email", value, normalizedValue: normalizeContact("email", value), personName, companyName, sourceName, sourceUrl, evidenceText: `${evidencePrefix} | Email ID = ${value}. ${reconciliation}. Row evidence: ${row}` });
+  for (const value of [...new Set(phones)]) candidates.push({ kind: "phone", value, normalizedValue: normalizePhone(value), personName, companyName, sourceName, sourceUrl, evidenceText: `${evidencePrefix} | Telephone = ${value}. ${reconciliation}. Row evidence: ${row}`, relatedBusinessPhones: business.phone ? [business.phone] : [] });
+  return { candidates, rejected: candidates.length ? [] : [{ sourceUrl, evidenceText: row, reason: "Structured vendor/person row contained no phone or email field." }], personFound: person.found, reconciliation: person.reason };
+}
+
+export async function searchPublicDocumentContact(personName: string, business: Business, options: PublicDocumentOptions = {}): Promise<ContactSourceDebug> {
+  const started = performance.now();
+  const debug = base("PUBLIC DOCUMENT CONTACT ENRICHMENT", personName, business);
+  debug.attempted = true; debug.status = "empty"; debug.documentsFound = []; debug.documentsAccepted = []; debug.documentsRejected = [];
+  const shortPerson = publicPersonSearchName(personName);
+  const queries = [
+    `site:mta.info/document ${business.name} ${shortPerson}`,
+    `"${business.name}" "${shortPerson}" procurement site:nyc.gov`,
+    `"${business.name}" vendor contact filetype:pdf`,
+  ];
+  debug.discoveryQueries = queries;
+  const search = options.search || searchBravePublicDocuments;
+  const fetchDocument = options.fetchDocument || fetchPublicDocument;
+  for (const query of queries) {
+    debug.searchQuery = query;
+    const response = await search(query);
+    if (response.status === "blocked" || response.status === "timeout" || response.status === "error") { debug.status = response.status; debug.reason = response.reason; break; }
+    for (const hit of response.hits.slice(0, 4)) {
+      if (!officialDocumentUrl(hit.url) || debug.documentsFound.some((item) => item.url === hit.url)) continue;
+      debug.documentsFound.push({ title: hit.title, url: hit.url });
+      const document = await fetchDocument(hit.url);
+      const direct = document.status === "ok" && document.text ? parseStructuredPublicDocumentContact(document.text, personName, business, hit.url, debug.sourceName) : undefined;
+      const indexedText = `${hit.title}. ${hit.snippet}`;
+      const indexed = parseStructuredPublicDocumentContact(indexedText, personName, business, hit.url, debug.sourceName);
+      const parsed = direct?.candidates.length ? direct : indexed;
+      if (!parsed.candidates.length) {
+        const reason = document.status === "ok" ? parsed.rejected[0]?.reason || "No structured contact row." : `${document.reason || document.status}; indexed result also lacked a structured contact row.`;
+        debug.documentsRejected.push({ url: hit.url, reason }); debug.rejectedCandidates.push({ sourceUrl: hit.url, evidenceText: indexedText, reason }); continue;
+      }
+      debug.candidatesFound.push(...parsed.candidates); debug.documentsAccepted.push(hit.url); debug.personMatch = true; debug.nameReconciliation = parsed.reconciliation;
+      debug.status = "matched"; debug.reason = document.status === "ok" ? "Official public document contained a structured vendor + named contact + contact field association." : "Official document was discovered and its indexed structured vendor row contained a named contact field; direct document fetch was blocked.";
+      debug.durationMs = Math.round(performance.now() - started);
+      return debug;
+    }
+  }
+  debug.reason ||= debug.documentsFound.length ? "Official documents were checked but no structured company + confirmed person + contact field was established." : "No relevant official public documents were discovered.";
+  debug.durationMs = Math.round(performance.now() - started);
+  return debug;
+}
 
 type FmcsaCensusEntity = { legal_name?: string; company_officer_1?: string; company_officer_2?: string; phy_city?: string; phy_state?: string; phy_zip?: string; add_date?: string; dot_number?: string; docket1prefix?: string; docket1?: string; phone?: string };
 
