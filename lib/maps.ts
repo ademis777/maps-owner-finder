@@ -40,8 +40,14 @@ export function parseAddressParts(address?:string):{city?:string;state?:string;z
   return{city,state,zip,error:!state?"A full address was found, but its US state could not be parsed.":undefined};
 }
 
+function splitMapsBusinessQuery(value?:string):{name?:string;address?:string}{
+  const decoded=clean(value);if(!decoded)return{};
+  const match=decoded.match(/^(.+?),\s*((?:\d+|[A-Z]-?\d+)\s+[^,]+,\s*[^,]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)(?:,\s*(?:United States|USA))?$/i);
+  return match?{name:clean(match[1]),address:clean(match[2])}:{name:decoded};
+}
+
 export function parseMapsUrl(url:string):ParsedFields{
-  try{const parsed=new URL(url);const preview=parsed.pathname.includes("/maps/preview/place/");const part=parsed.pathname.match(/\/maps\/(?:preview\/)?(?:place|search)\/([^/]+)/i)?.[1];const query=parsed.searchParams.get("query")||parsed.searchParams.get("q");const decoded=part?decodePathPart(part):query?decodePathPart(query):undefined;let name=decoded,address:string|undefined;if(preview&&decoded){const match=decoded.match(/^(.+?),\s*((?:\d+|[A-Z]-?\d+)\s+.+?,\s*[^,]+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)(?:,.*)?$/i);if(match){name=clean(match[1]);address=clean(match[2]);}}const p=parseAddressParts(address);const coord=`${parsed.pathname}${parsed.search}`.match(/@(-?\d{1,3}\.\d+),(-?\d{1,3}\.\d+)/);const placeId=`${parsed.pathname}${parsed.search}`.match(/!1s([^!]+)/)?.[1]||parsed.searchParams.get("query_place_id")||undefined;return{name,address,city:p.city,state:p.state,zip:p.zip,coordinates:coord?{latitude:Number(coord[1]),longitude:Number(coord[2])}:undefined,placeId:placeId?decodePathPart(placeId):undefined};}catch{return{};}
+  try{const parsed=new URL(url);const part=parsed.pathname.match(/\/maps\/(?:preview\/)?(?:place|search)\/([^/]+)/i)?.[1];const query=parsed.searchParams.get("query")||parsed.searchParams.get("q");const decoded=part?decodePathPart(part):query?decodePathPart(query):undefined;const identity=splitMapsBusinessQuery(decoded);const p=parseAddressParts(identity.address);const coord=`${parsed.pathname}${parsed.search}`.match(/@(-?\d{1,3}\.\d+),(-?\d{1,3}\.\d+)/);const placeId=`${parsed.pathname}${parsed.search}`.match(/!1s([^!]+)/)?.[1]||parsed.searchParams.get("query_place_id")||undefined;return{name:identity.name,address:identity.address,city:p.city,state:p.state,zip:p.zip,coordinates:coord?{latitude:Number(coord[1]),longitude:Number(coord[2])}:undefined,placeId:placeId?decodePathPart(placeId):undefined};}catch{return{};}
 }
 
 function addCandidate(target:FieldCandidates,field:MapsFieldName,value:string|undefined,source:MapsFieldSource,confidence:number,evidence?:string){const v=clean(value);if(v)(target[field]||=[]).push({value:v,source,confidence,evidence});}

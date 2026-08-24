@@ -40,6 +40,15 @@ test("encoded Maps search URL exposes a decoded business name", () => {
   assert.equal(parseMapsUrl("https://www.google.com/maps/search/?api=1&query=John%27s%20Auto%20Repair").name, "John's Auto Repair");
 });
 
+test("Maps search query separates company from a structured US address", () => {
+  const result = parseMapsUrl("https://www.google.com/maps/search/?api=1&query=Jets+Towing+Inc%2C+918+E+51st+St%2C+Brooklyn%2C+NY+11203");
+  assert.equal(result.name, "Jets Towing Inc");
+  assert.equal(result.address, "918 E 51st St, Brooklyn, NY 11203");
+  assert.equal(result.city, "Brooklyn");
+  assert.equal(result.state, "NY");
+  assert.equal(result.zip, "11203");
+});
+
 test("address parser extracts city, state, and ZIP", () => {
   assert.deepEqual(parseAddressParts("10 Main St, Hartford, Connecticut 06103, United States"), { city: "Hartford", state: "CT", zip: "06103", error: undefined });
 });
